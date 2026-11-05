@@ -89,15 +89,25 @@ class NavigationHandler(BaseHandler):
         return await indicators.count() > 0 and await indicators.first.is_visible()
 
     async def _ensure_scrolled_to_bottom(self, target: Page | Frame):
-        """Scrolls any active task container or reading area to the bottom to unlock Next button."""
+        """Scrolls any active task container or reading area to the bottom/end to unlock Next button."""
         try:
             await target.evaluate("""() => {
-                const scrollers = Array.from(document.querySelectorAll('[cdkscrollable], .task-area, .content-area, ef-task-layout, main'));
+                const scrollers = Array.from(document.querySelectorAll(
+                    '[cdkscrollable], .task-area, .content-area, ef-task-layout, main, .flashcard-list, .flashcards-container, [class*="scroll"], [class*="container"]'
+                ));
                 for (const s of scrollers) {
                     if (s.scrollHeight > s.clientHeight) {
                         s.scrollTop = s.scrollHeight;
                         s.dispatchEvent(new Event('scroll'));
                     }
+                    if (s.scrollWidth > s.clientWidth) {
+                        s.scrollLeft = s.scrollWidth;
+                        s.dispatchEvent(new Event('scroll'));
+                    }
+                }
+                const observers = Array.from(document.querySelectorAll('[ef-visibility-observer]'));
+                for (const obs of observers) {
+                    obs.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'nearest' });
                 }
             }""")
         except Exception:
@@ -190,7 +200,22 @@ class NavigationHandler(BaseHandler):
             self._consecutive_nexts = 0
             return True
 
-        # 5. Next / Continue button (always prioritize moving forward over repeating skipped tasks)
+        # 5. Check if the activity explicitly failed to reach passing score and needs retry
+        is_unpassed = await target.locator('text=/Activity: Not passed|Step not passed/i').count() > 0
+        finish_skipped = self._get_finish_skipped_button(target)
+        if is_unpassed and await finish_skipped.count() > 0:
+            txt = (await finish_skipped.inner_text()).strip()
+            print(f"  [Navigation] Activity/Step not passed. Clicking '{txt}' to achieve required passing score...")
+            await self.sleep_delay(0.5, 1.0)
+            try:
+                await finish_skipped.click(timeout=3000)
+            except Exception:
+                await finish_skipped.dispatch_event("click")
+            await self.sleep_delay(1.0, 1.5)
+            self._consecutive_nexts = 0
+            return True
+
+        # 6. Next / Continue button (prioritize moving forward when passed)
         next_btn = self._get_next_button(target)
         if await next_btn.count() > 0:
             btn_text = (await next_btn.inner_text()).strip()
@@ -208,8 +233,7 @@ class NavigationHandler(BaseHandler):
             await self.sleep_delay(1.0, 1.5)
             return True
 
-        # 6. Finish skipped tasks / retry (ONLY when neither step_btn nor next_btn is available)
-        finish_skipped = self._get_finish_skipped_button(target)
+        # 7. Fallback Finish skipped tasks / retry (when Next is not available)
         if await finish_skipped.count() > 0:
             txt = (await finish_skipped.inner_text()).strip()
             print(f"  [Navigation] Clicking '{txt}' to complete required activity...")

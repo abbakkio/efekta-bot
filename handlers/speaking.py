@@ -225,12 +225,18 @@ class SpeakingHandler(BaseHandler):
 
     async def _extract_target_phrase(self, target: Page | Frame) -> str:
         """Extracts the exact target sentence or option for the active speech task."""
-        # A. Check VISIBLE multiple choice speech task response options first
+        # A. Check VISIBLE multiple choice speech task response options first (filtering out already marked incorrect)
         try:
-            options_loc = target.locator("ef-multiple-choice-speech-task-response-option:visible label.content:visible")
+            options_loc = target.locator("ef-multiple-choice-speech-task-response-option:not(.incorrect):visible label.content:visible")
             opt_count = await options_loc.count()
             if opt_count > 0:
                 txt = (await options_loc.first.inner_text()).strip()
+                if txt:
+                    return txt
+            # Fallback if all options were marked incorrect
+            all_opts = target.locator("ef-multiple-choice-speech-task-response-option:visible label.content:visible")
+            if await all_opts.count() > 0:
+                txt = (await all_opts.first.inner_text()).strip()
                 if txt:
                     return txt
         except Exception:

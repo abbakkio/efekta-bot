@@ -16,6 +16,7 @@ from handlers import (
     MatchingHandler,
     WritingHandler,
     SequencingHandler,
+    FlashcardHandler,
 )
 
 PROFILE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chrome_profile")
@@ -273,6 +274,7 @@ async def solve_unit(initial_page: Page, context: BrowserContext, target_complet
         CategorisationHandler(),
         SequencingHandler(),
         WritingHandler(),
+        FlashcardHandler(),
         MultipleChoiceHandler(),
         GapFillHandler(),
         MediaPlaybackHandler(),

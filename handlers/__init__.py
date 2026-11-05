@@ -9,6 +9,7 @@ from .categorisation import CategorisationHandler
 from .matching import MatchingHandler
 from .writing import WritingHandler
 from .sequencing import SequencingHandler
+from .flashcard import FlashcardHandler
 
 __all__ = [
     "BaseHandler",
@@ -22,4 +23,5 @@ __all__ = [
     "MatchingHandler",
     "WritingHandler",
     "SequencingHandler",
+    "FlashcardHandler",
 ]
