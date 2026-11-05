@@ -137,8 +137,10 @@ class NavigationHandler(BaseHandler):
                 if (steps.length === 0) return false;
                 return steps.every(s => (s.getAttribute('aria-label') || '').includes('status passed'));
             }""")
-            is_passed = target.locator('button:has-text("Retake lesson"), text=/Lesson passed/i').first
-            if all_steps_passed or (await is_passed.count() > 0 and await is_passed.is_visible()):
+            retake_btn = target.locator('button:has-text("Retake lesson")').first
+            passed_badge = target.locator(':has-text("Lesson passed")').first
+            has_pass_badge = (await retake_btn.count() > 0 and await retake_btn.is_visible()) or (await passed_badge.count() > 0 and await passed_badge.is_visible())
+            if all_steps_passed or has_pass_badge:
                 return True
         return False
 
@@ -258,8 +260,9 @@ class NavigationHandler(BaseHandler):
                 if (steps.length === 0) return false;
                 return steps.every(s => (s.getAttribute('aria-label') || '').includes('status passed'));
             }""")
-            is_passed = target.locator('button:has-text("Retake lesson"), text=/Lesson passed/i').first
-            has_pass_badge = await is_passed.count() > 0 and await is_passed.is_visible()
+            retake_btn = target.locator('button:has-text("Retake lesson")').first
+            passed_badge = target.locator(':has-text("Lesson passed")').first
+            has_pass_badge = (await retake_btn.count() > 0 and await retake_btn.is_visible()) or (await passed_badge.count() > 0 and await passed_badge.is_visible())
             if all_steps_passed or has_pass_badge:
                 close_btn = self._get_close_lesson_button(target)
                 if await close_btn.count() > 0:
