@@ -27,8 +27,7 @@ class SpeakingHandler(BaseHandler):
             'button:visible[aria-label*="record" i], '
             'button:visible[aria-label*="stop" i], '
             'button:visible[data-testid*="record" i], '
-            'ef-audio-recorder button:visible, '
-            '.audio-recorder button:visible'
+            'ef-audio-recorder button:not([aria-label*="replay" i]):visible'
         ).first
 
     def _get_skip_button(self, target: Page | Frame):
@@ -296,6 +295,56 @@ class SpeakingHandler(BaseHandler):
 
         return ""
 
+    def _speak_phrase_aloud(self, text: str):
+        """Speaks the target phrase aloud using macOS TTS to supply audio to microphone."""
+        if not text:
+            return
+        clean_p = re.sub(r"[_]+", "", text)
+        clean_p = clean_p.replace('"', '').replace("'", '').replace('\n', ' ')
+        clean_p = re.sub(r"\s+", " ", clean_p).strip()
+        if not clean_p:
+            return
+        print(f"  [Speaking] Speaking phrase aloud via TTS: '{clean_p[:50]}'...")
+        try:
+            p = subprocess.Popen(["say", "-v", "Samantha", clean_p])
+            try:
+                p.wait(timeout=3.5)
+            except subprocess.TimeoutExpired:
+                p.kill()
+        except Exception as e:
+            print(f"  [Speaking] Note: TTS speak aloud failed ({e})")
+
+    async def _wait_for_evaluation(self, target: Page | Frame, timeout: float = 3.5):
+        """Waits dynamically for Next button to become enabled or recorder to leave recording state."""
+        start = asyncio.get_event_loop().time()
+        while asyncio.get_event_loop().time() - start < timeout:
+            advance_btn = target.locator(
+                'button[class*="next-task-button"]:not([disabled]):not(.mat-mdc-button-disabled):visible, '
+                'button[class*="main-next"]:not([disabled]):not(.mat-mdc-button-disabled):visible, '
+                'button.mat-mdc-unelevated-button:not([disabled]):not(.mat-mdc-button-disabled):visible:has-text("Next"), '
+                'button.mat-mdc-unelevated-button:not([disabled]):not(.mat-mdc-button-disabled):visible:has-text("Continue"), '
+                'button[data-testid*="next" i]:not([disabled]):visible'
+            ).first
+            try:
+                if await advance_btn.count() > 0 and not await advance_btn.is_disabled():
+                    return True
+            except Exception:
+                pass
+
+            rec_btn = self._get_recorder_button(target)
+            try:
+                if await rec_btn.count() > 0:
+                    aria = (await rec_btn.get_attribute("aria-label") or "").lower()
+                    cls = (await rec_btn.get_attribute("class") or "").lower()
+                    has_replay = await target.locator('ef-svg-replay').count() > 0
+                    if "not quite right" in aria or "try again" in aria or "no-pointer" in cls or has_replay:
+                        return True
+            except Exception:
+                pass
+
+            await asyncio.sleep(0.3)
+        return True
+
     async def handle(self, target: Page | Frame) -> bool:
         # Ensure context routing is attached
         try:
@@ -342,103 +391,83 @@ class SpeakingHandler(BaseHandler):
         is_mc_speech = await target.locator('ef-multiple-choice-speech-task:visible').count() > 0
         max_attempts = 2 if is_mc_speech else 1
 
-        # If evaluated and didn't pass, or max attempts reached, advance via SKIP if available
-        if attempts >= max_attempts and await skip_btn.count() > 0:
-            print(f"  [Speaking] Attempt {attempts} reached threshold for {phrase_key}. Advancing via SKIP...")
-            await self.sleep_delay(0.5, 0.8)
-            try:
-                await skip_btn.click(timeout=3000)
-            except Exception:
-                await skip_btn.dispatch_event("click")
-            await self.sleep_delay(1.5, 2.0)
-            self._task_attempts[phrase_key] = 0
-            return True
-
+        # 1. Check if the recorder is in evaluated (incorrect / replay / no-pointer) state
+        is_evaluated_incorrect = False
+        aria_label = ""
+        class_attr = ""
         if await rec_btn.count() > 0:
             aria_label = (await rec_btn.get_attribute("aria-label") or "").lower()
-            is_recording = await rec_btn.locator('ef-svg-stop').count() > 0 or "recording" in aria_label or "stop" in aria_label
+            class_attr = (await rec_btn.get_attribute("class") or "").lower()
+            has_replay = await target.locator('ef-svg-replay').count() > 0
+            if "not quite right" in aria_label or "try again" in aria_label or "no-pointer" in class_attr or has_replay:
+                is_evaluated_incorrect = True
 
-            if is_recording:
-                print("  [Speaking] Recording in progress. Finalizing recording...")
-                await self.sleep_delay(0.5, 1.0)
+        # 2. If already evaluated as incorrect or attempt threshold reached:
+        if is_evaluated_incorrect or attempts >= max_attempts or (not is_mc_speech and is_evaluated_incorrect):
+            if await skip_btn.count() > 0:
+                print(f"  [Speaking] Evaluation incorrect ({aria_label or 'try again'}) or threshold reached. Advancing via SKIP...")
+                await self.sleep_delay(0.2, 0.4)
                 try:
-                    await rec_btn.click(timeout=3000)
+                    await skip_btn.click(timeout=3000)
                 except Exception:
-                    await rec_btn.dispatch_event("click")
-                await self.sleep_delay(3.5, 4.5)
-                self._task_attempts[phrase_key] = attempts + 1
+                    await skip_btn.dispatch_event("click")
+                await self.sleep_delay(1.0, 1.5)
+                self._task_attempts[phrase_key] = 0
                 return True
 
-            # If the recorder says "not quite right" or "try again", count as an attempt
-            if "not quite right" in aria_label or "try again" in aria_label:
-                if attempts >= max_attempts and await skip_btn.count() > 0:
-                    print(f"  [Speaking] Speech evaluated as '{aria_label}'. Advancing via SKIP...")
-                    try:
-                        await skip_btn.click(timeout=3000)
-                    except Exception:
-                        await skip_btn.dispatch_event("click")
-                    await self.sleep_delay(1.5, 2.0)
-                    self._task_attempts[phrase_key] = 0
-                    return True
-
-            print("  [Speaking] Triggering recording...")
-            try:
-                await rec_btn.click(timeout=3000)
-            except Exception:
-                await rec_btn.dispatch_event("click")
-
-            # Speak target phrase aloud through macOS speakers to feed into the microphone
-            phrase_to_speak = detected or self._last_detected_phrase
-            if phrase_to_speak:
-                clean_p = re.sub(r"[_]+", "", phrase_to_speak)
-                clean_p = clean_p.replace('"', '').replace("'", '').replace('\n', ' ')
-                clean_p = re.sub(r"\s+", " ", clean_p).strip()
-                if clean_p:
-                    print(f"  [Speaking] Speaking phrase aloud via TTS: '{clean_p[:50]}'...")
-                    try:
-                        p = subprocess.Popen(["say", "-v", "Samantha", clean_p])
-                        try:
-                            p.wait(timeout=4.0)
-                        except subprocess.TimeoutExpired:
-                            p.kill()
-                    except Exception as e:
-                        print(f"  [Speaking] Note: TTS speak aloud failed ({e})")
-            else:
-                await asyncio.sleep(1.5)
-
-            await asyncio.sleep(0.5)
-
-            stop_btn = self._get_recorder_button(target)
-            if await stop_btn.count() > 0:
-                stop_aria = (await stop_btn.get_attribute("aria-label") or "").lower()
-                if "recording" in stop_aria or "stop" in stop_aria or await stop_btn.locator('ef-svg-stop').count() > 0:
+        # 3. Handle active recording in progress (e.g. Efekta auto-started recording)
+        if await rec_btn.count() > 0:
+            is_recording = await rec_btn.locator('ef-svg-stop').count() > 0 or "recording" in aria_label or "stop" in aria_label
+            if is_recording:
+                print("  [Speaking] Recording in progress. Speaking phrase aloud...")
+                self._speak_phrase_aloud(detected or self._last_detected_phrase)
+                await asyncio.sleep(0.3)
+                stop_btn = self._get_recorder_button(target)
+                if await stop_btn.count() > 0:
                     print("  [Speaking] Stopping recording for evaluation...")
                     try:
                         await stop_btn.click(timeout=3000)
                     except Exception:
                         await stop_btn.dispatch_event("click")
-                    await self.sleep_delay(3.5, 4.5)
-                else:
-                    # Transitioned from replay/incorrect to ready_to_record, trigger record and stop
-                    try:
-                        await stop_btn.click(timeout=3000)
-                        await asyncio.sleep(1.5)
-                        await stop_btn.click(timeout=3000)
-                    except Exception:
-                        pass
-                    await self.sleep_delay(3.5, 4.5)
+                await self._wait_for_evaluation(target)
+                self._task_attempts[phrase_key] = attempts + 1
+                return True
 
-            self._task_attempts[phrase_key] = attempts + 1
-            return True
+            # 4. Trigger new recording attempt
+            if not is_evaluated_incorrect:
+                print("  [Speaking] Triggering recording...")
+                try:
+                    await rec_btn.click(timeout=3000)
+                except Exception:
+                    await rec_btn.dispatch_event("click")
 
+                await asyncio.sleep(0.3)
+                self._speak_phrase_aloud(detected or self._last_detected_phrase)
+                await asyncio.sleep(0.3)
+
+                stop_btn = self._get_recorder_button(target)
+                if await stop_btn.count() > 0:
+                    stop_aria = (await stop_btn.get_attribute("aria-label") or "").lower()
+                    if "recording" in stop_aria or "stop" in stop_aria or await stop_btn.locator('ef-svg-stop').count() > 0:
+                        print("  [Speaking] Stopping recording for evaluation...")
+                        try:
+                            await stop_btn.click(timeout=3000)
+                        except Exception:
+                            await stop_btn.dispatch_event("click")
+
+                await self._wait_for_evaluation(target)
+                self._task_attempts[phrase_key] = attempts + 1
+                return True
+
+        # 5. Fallback: if SKIP is available, advance
         if await skip_btn.count() > 0:
             print("  [Speaking] Advancing via SKIP...")
-            await self.sleep_delay(0.5, 0.8)
+            await self.sleep_delay(0.2, 0.4)
             try:
                 await skip_btn.click(timeout=3000)
             except Exception:
                 await skip_btn.dispatch_event("click")
-            await self.sleep_delay(1.5, 2.0)
+            await self.sleep_delay(1.0, 1.5)
             return True
 
         return False
