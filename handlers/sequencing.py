@@ -103,6 +103,18 @@ class SequencingHandler(BaseHandler):
     def __init__(self):
         super().__init__()
         self._failed_permutations = set()
+        self._invalid_token_positions = set()  # set of (word, absolute_position_index)
+        self._current_task_signature = None
+
+    def _check_task_reset(self, all_words: list[str]):
+        """Resets failed permutations and position constraints when a new task is detected."""
+        if not all_words:
+            return
+        sig = tuple(sorted(all_words))
+        if self._current_task_signature != sig:
+            self._current_task_signature = sig
+            self._failed_permutations.clear()
+            self._invalid_token_positions.clear()
 
     async def can_handle(self, target: Page | Frame) -> bool:
         next_btn = target.locator(
@@ -182,11 +194,18 @@ class SequencingHandler(BaseHandler):
             return []
 
         prefix = prefix or []
+        p_len = len(prefix)
+        total_len = p_len + len(words)
+
         end_candidates = [w for w in words if w.endswith(('.', '?', '!'))]
         end = end_candidates[0] if end_candidates else None
+        if end and (end, total_len - 1) in self._invalid_token_positions:
+            end = None
 
         start_candidates = [w for w in words if w[0].isupper() and not w.endswith(('.', '?', '!'))] if not prefix else []
         start = start_candidates[0] if start_candidates else None
+        if start and (start, p_len) in self._invalid_token_positions:
+            start = None
 
         mid_copy = list(words)
         if start and start in mid_copy:
@@ -195,18 +214,52 @@ class SequencingHandler(BaseHandler):
             mid_copy.remove(end)
 
         middle = mid_copy
-        perms = list(itertools.permutations(middle))
+        # If middle has more than 7 tokens, limit to first 5000 permutations for snappy response
+        if len(middle) > 7:
+            perms = list(itertools.islice(itertools.permutations(middle), 5000))
+        else:
+            perms = list(itertools.permutations(middle))
 
-        def score_candidate(perm):
-            suffix = ([start] if start else []) + list(perm) + ([end] if end else [])
+        def make_suffix(perm):
+            return ([start] if start else []) + list(perm) + ([end] if end else [])
+
+        candidates = [make_suffix(p) for p in perms]
+
+        def is_valid_candidate(suffix: list[str], strict_all: bool = True) -> bool:
+            full = tuple(prefix + suffix)
+            if full in self._failed_permutations:
+                return False
+
+            if strict_all:
+                for j, w in enumerate(suffix):
+                    abs_pos = p_len + j
+                    if (w, abs_pos) in self._invalid_token_positions:
+                        return False
+            else:
+                # Relaxed: strictly enforce immediate next position
+                if suffix and (suffix[0], p_len) in self._invalid_token_positions:
+                    return False
+            return True
+
+        # 1. Filter candidates that satisfy all position constraints and haven't failed
+        valid = [c for c in candidates if is_valid_candidate(c, strict_all=True)]
+        if not valid:
+            valid = [c for c in candidates if is_valid_candidate(c, strict_all=False)]
+        if not valid:
+            valid = [c for c in candidates if tuple(prefix + c) not in self._failed_permutations]
+
+        candidates_to_sort = valid if valid else candidates
+
+        def score_candidate(suffix):
             full_seq = prefix + suffix
-            return self._score_sentence(full_seq)
+            score = self._score_sentence(full_seq)
+            # Prioritize candidates whose immediate next word is untried at this slot
+            if suffix and (suffix[0], p_len) not in self._invalid_token_positions:
+                score += 150
+            return score
 
-        perms.sort(key=score_candidate, reverse=True)
-        candidates = [([start] if start else []) + list(p) + ([end] if end else []) for p in perms]
-
-        valid = [c for c in candidates if tuple(prefix + c) not in self._failed_permutations]
-        return valid if valid else candidates
+        candidates_to_sort.sort(key=score_candidate, reverse=True)
+        return candidates_to_sort
 
     async def _handle_cdk_drag(self, target: Page | Frame) -> bool:
         """Handles Angular CDK Drag and Drop column sequencing tasks."""
@@ -243,6 +296,93 @@ class SequencingHandler(BaseHandler):
             await asyncio.sleep(2.0)
         return True
 
+    async def _submit_and_record(self, target: Page | Frame, check_btn, full_display: list[str]) -> bool:
+        """Clicks Check, reads per-token assessment, records invalid token positions, and resets unconfirmed tokens."""
+        print(f"  [Sequencing] Submitting sequence: {' '.join(full_display)}...")
+        await self.sleep_delay(0.4, 0.7)
+        await check_btn.click()
+
+        # Wait 0.7s for Angular assessment classes to render before Efekta's 1500ms reset timer
+        await asyncio.sleep(0.7)
+
+        # Check if Next button got enabled
+        next_btn = target.locator(
+            'button[class*="next-task-button"]:not([disabled]):not(.mat-mdc-button-disabled):visible, '
+            'button.mat-mdc-unelevated-button:not([disabled]):not(.mat-mdc-button-disabled):visible:has-text("Next")'
+        ).first
+        if await next_btn.count() > 0:
+            print("  [Sequencing] Sequence accepted! Next is enabled.")
+            self._failed_permutations.clear()
+            self._invalid_token_positions.clear()
+            return True
+
+        # Read assessment from DOM elements
+        assessment = await target.evaluate(r'''() => {
+            const extractWord = (b) => {
+                if (!b) return '';
+                const el = b.querySelector('[data-qa="markdown-element-container"]');
+                if (el) return el.innerText.trim();
+                return (b.innerText || '').split('\n')[0].trim();
+            };
+            const isItemCorrect = (el) => {
+                if (!el) return false;
+                if (el.classList.contains('is-correct') || el.classList.contains('item-correct')) return true;
+                if (el.querySelector('.is-correct, .item-correct, .correct-circle, ef-svg-thumbs-up, [id="thumbs-up"]')) return true;
+                return false;
+            };
+            const isItemIncorrect = (el) => {
+                if (!el) return false;
+                if (el.classList.contains('is-incorrect') || el.classList.contains('item-incorrect')) return true;
+                if (el.querySelector('.is-incorrect, .item-incorrect, .incorrect-circle, ef-svg-thumbs-down, [id="thumbs-down"]')) return true;
+                return false;
+            };
+            const orderedEls = Array.from(document.querySelectorAll(
+                '.ordered-item-container > li, .ordered-item-container ef-sequencing-tap-option-item'
+            ));
+            return orderedEls.map((el, i) => ({
+                index: i,
+                word: extractWord(el),
+                isCorrect: isItemCorrect(el),
+                isIncorrect: isItemIncorrect(el)
+            }));
+        }''')
+
+        self._failed_permutations.add(tuple(full_display))
+
+        # Identify the first incorrect position
+        first_failed_idx = None
+        for item in assessment:
+            idx = item['index']
+            word = item['word'] or (full_display[idx] if idx < len(full_display) else '')
+            if item['isIncorrect'] or not item['isCorrect']:
+                if first_failed_idx is None:
+                    first_failed_idx = idx
+                if word:
+                    self._invalid_token_positions.add((word, idx))
+
+        if first_failed_idx is not None and first_failed_idx < len(full_display):
+            failed_word = full_display[first_failed_idx]
+            print(f"  [Sequencing] Word '{failed_word}' incorrect at position {first_failed_idx}. Excluded from slot {first_failed_idx}.")
+        elif len(full_display) > 1:
+            fallback_idx = 1
+            self._invalid_token_positions.add((full_display[fallback_idx], fallback_idx))
+
+        # Wait for Efekta's 1500ms reset timer to complete
+        await asyncio.sleep(1.2)
+
+        # Return any unconfirmed items that still have a button back to the pool
+        while True:
+            ret = await target.evaluate('''() => {
+                const b = document.querySelector('.ordered-item-container button');
+                if (b) { b.click(); return true; }
+                return false;
+            }''')
+            if not ret:
+                break
+            await asyncio.sleep(0.3)
+
+        return True
+
     async def handle(self, target: Page | Frame) -> bool:
         # Check if CDK Drag and Drop column sorting is active (ef-sequencing-sort-column-task)
         sort_column = target.locator('ef-sequencing-sort-column-task:visible')
@@ -252,6 +392,22 @@ class SequencingHandler(BaseHandler):
 
         check_btn = target.locator('button.check-task-button:visible').first
 
+        # Collect all words in the exercise to detect task changes
+        all_words = await target.evaluate(r'''() => {
+            const extractWord = (b) => {
+                if (!b) return '';
+                const el = b.querySelector('[data-qa="markdown-element-container"]');
+                if (el) return el.innerText.trim();
+                return (b.innerText || '').split('\n')[0].trim();
+            };
+            const ordered = Array.from(document.querySelectorAll(
+                '.ordered-item-container > li, .ordered-item-container ef-sequencing-tap-option-item, .ordered-item-container .item'
+            )).map(extractWord);
+            const unordered = Array.from(document.querySelectorAll('.unordered-item-container button')).map(extractWord);
+            return [...ordered, ...unordered].filter(Boolean);
+        }''')
+        self._check_task_reset(all_words)
+
         # 1. Inspect active state of ordered and unordered containers
         state = await target.evaluate(r'''() => {
             const extractWord = (b) => {
@@ -260,13 +416,34 @@ class SequencingHandler(BaseHandler):
                 if (el) return el.innerText.trim();
                 return (b.innerText || '').split('\n')[0].trim();
             };
-            const lockedPrefix = Array.from(document.querySelectorAll('.ordered-item-container .item.is-correct'))
-                .map(extractWord);
-            const unassessedOrdered = Array.from(document.querySelectorAll('.ordered-item-container button'))
-                .map(extractWord);
+            const isItemCorrect = (el) => {
+                if (!el) return false;
+                if (el.classList.contains('is-correct') || el.classList.contains('item-correct')) return true;
+                if (el.querySelector('.is-correct, .item-correct, .correct-circle, ef-svg-thumbs-up, [id="thumbs-up"]')) return true;
+                return false;
+            };
+
+            const orderedEls = Array.from(document.querySelectorAll(
+                '.ordered-item-container > li, .ordered-item-container ef-sequencing-tap-option-item'
+            ));
+
+            // STRICT CONTINUOUS PREFIX from index 0:
+            // Stop immediately at the first non-correct element so that any words after a gap are NOT locked.
+            const lockedPrefix = [];
+            for (let i = 0; i < orderedEls.length; i++) {
+                const item = orderedEls[i];
+                if (isItemCorrect(item)) {
+                    lockedPrefix.push(extractWord(item));
+                } else {
+                    break;
+                }
+            }
+
+            const unassessedOrdered = orderedEls.slice(lockedPrefix.length).map(extractWord).filter(Boolean);
             const unorderedWords = Array.from(document.querySelectorAll('.unordered-item-container button'))
                 .map(extractWord).filter(Boolean);
-            const checkEnabled = document.querySelector('button.check-task-button') && !document.querySelector('button.check-task-button').disabled;
+            const checkBtn = document.querySelector('button.check-task-button');
+            const checkEnabled = checkBtn && !checkBtn.disabled && !checkBtn.classList.contains('mat-mdc-button-disabled');
             return {
                 lockedPrefix,
                 unassessedOrdered,
@@ -280,32 +457,10 @@ class SequencingHandler(BaseHandler):
         unordered_words = state['unorderedWords']
         check_enabled = state['checkEnabled']
 
-        # 2. If all items are ordered and Check button is enabled, click Check
+        # 2. If all items are already ordered and Check button is enabled, submit
         if not unordered_words and check_enabled:
             current_full = locked_prefix + unassessed_ordered
-            print(f"  [Sequencing] Submitting sequence: {' '.join(current_full)}...")
-            await self.sleep_delay(0.4, 0.7)
-            await check_btn.click()
-            await asyncio.sleep(2.0)
-
-            next_btn = target.locator('button[class*="next-task-button"]:not([disabled]):not(.mat-mdc-button-disabled):visible, button.mat-mdc-unelevated-button:not([disabled]):not(.mat-mdc-button-disabled):visible:has-text("Next")').first
-            if await next_btn.count() > 0:
-                print("  [Sequencing] Sequence accepted! Next is enabled.")
-                self._failed_permutations.clear()
-                return True
-            else:
-                print(f"  [Sequencing] Sequence rejected. Recording failure: {tuple(current_full)}")
-                self._failed_permutations.add(tuple(current_full))
-                while True:
-                    ret = await target.evaluate('''() => {
-                        const b = document.querySelector('.ordered-item-container button');
-                        if (b) { b.click(); return true; }
-                        return false;
-                    }''')
-                    if not ret:
-                        break
-                    await asyncio.sleep(0.3)
-                return True
+            return await self._submit_and_record(target, check_btn, current_full)
 
         # 3. If there are unassessed buttons in ordered container while unordered pool is not empty, reset them
         if unassessed_ordered and unordered_words:
@@ -374,26 +529,6 @@ class SequencingHandler(BaseHandler):
 
         # 6. Click Check if enabled
         if await check_btn.count() > 0 and not await check_btn.is_disabled():
-            print("  [Sequencing] Clicking 'Check'...")
-            await check_btn.click()
-            await asyncio.sleep(2.0)
-
-            next_btn = target.locator('button[class*="next-task-button"]:not([disabled]):not(.mat-mdc-button-disabled):visible, button.mat-mdc-unelevated-button:not([disabled]):not(.mat-mdc-button-disabled):visible:has-text("Next")').first
-            if await next_btn.count() > 0:
-                print("  [Sequencing] Sequence accepted! Next is enabled.")
-                self._failed_permutations.clear()
-            else:
-                failed_tuple = tuple(full_display)
-                print(f"  [Sequencing] Sequence rejected. Recording failure: {failed_tuple}")
-                self._failed_permutations.add(failed_tuple)
-                while True:
-                    ret = await target.evaluate('''() => {
-                        const b = document.querySelector('.ordered-item-container button');
-                        if (b) { b.click(); return true; }
-                        return false;
-                    }''')
-                    if not ret:
-                        break
-                    await asyncio.sleep(0.3)
+            return await self._submit_and_record(target, check_btn, full_display)
 
         return True
