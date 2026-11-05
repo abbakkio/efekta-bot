@@ -6,18 +6,19 @@ class FlashcardHandler(BaseHandler):
     """Handles flashcard tasks: flips unflipped vocabulary cards and scrolls to the end to trigger visibility observers and unlock Next."""
 
     async def can_handle(self, target: Page | Frame) -> bool:
-        # 1. If Next or Continue is already unlocked, let NavigationHandler proceed
-        next_btn = target.locator(
-            'button[class*="next-task-button"]:not([disabled]):not(.mat-mdc-button-disabled):visible, '
-            'button[class*="main-next"]:not([disabled]):not(.mat-mdc-button-disabled):visible, '
-            'button.mat-mdc-unelevated-button:not([disabled]):not(.mat-mdc-button-disabled):visible:has-text("Next")'
-        ).first
-        if await next_btn.count() > 0:
+        cards = target.locator("ef-flashcard, ef-flashcards-task, .flashcard-list, .flashcards-container")
+        if await cards.count() == 0:
             return False
 
-        # 2. Check if flashcard container or cards exist
-        cards = target.locator("ef-flashcard, ef-flashcards-task, .flashcard-list, .flashcards-container")
-        return await cards.count() > 0
+        # Handle if there are any unflipped cards
+        has_unflipped = await target.evaluate("""() => {
+            const cards = Array.from(document.querySelectorAll('ef-flashcard'));
+            return cards.some(c => {
+                const inner = c.querySelector('.flip-card-inner');
+                return inner && !inner.classList.contains('is-flipped');
+            });
+        }""")
+        return has_unflipped
 
     async def handle(self, target: Page | Frame) -> bool:
         print("  [Flashcards] Processing vocabulary flashcards...")

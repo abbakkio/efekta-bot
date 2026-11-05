@@ -178,7 +178,34 @@ class NavigationHandler(BaseHandler):
             await self.sleep_delay(0.5, 1.0)
             return True
 
-        # 3. Next / Continue button (prioritize moving forward when task/activity is complete)
+        # 3. Check if the step or activity explicitly failed to reach passing score and needs retry
+        is_step_passed = await target.locator('text=/Step passed!/i').count() > 0
+        is_unpassed = await target.locator('text=/Activity: Not passed|Step not passed/i').count() > 0
+        finish_skipped = self._get_finish_skipped_button(target)
+        if is_unpassed and not is_step_passed and await finish_skipped.count() > 0:
+            txt = (await finish_skipped.inner_text()).strip()
+            print(f"  [Navigation] Activity/Step not passed. Clicking '{txt}' to achieve required passing score...")
+            await self.sleep_delay(0.5, 1.0)
+            try:
+                await finish_skipped.click(timeout=3000)
+            except Exception:
+                await finish_skipped.dispatch_event("click")
+            await self.sleep_delay(1.0, 1.5)
+            self._consecutive_nexts = 0
+            return True
+
+        # 4. Step launcher buttons on lesson overview or step summary (e.g. "Start next step" / "Start step")
+        step_btn = self._get_step_button(target)
+        if await step_btn.count() > 0:
+            aria = await step_btn.get_attribute("aria-label") or "Next step"
+            print(f"  [Navigation] Launching step: {aria[:40]}...")
+            await self.sleep_delay(0.5, 1.0)
+            await step_btn.click()
+            await self.sleep_delay(1.0, 1.5)
+            self._consecutive_nexts = 0
+            return True
+
+        # 5. Next / Continue button (prioritize moving forward when task/activity is complete)
         next_btn = self._get_next_button(target)
         if await next_btn.count() > 0:
             btn_text = (await next_btn.inner_text()).strip()
@@ -196,22 +223,7 @@ class NavigationHandler(BaseHandler):
             await self.sleep_delay(1.0, 1.5)
             return True
 
-        # 4. Check if the activity explicitly failed to reach passing score and needs retry
-        is_unpassed = await target.locator('text=/Activity: Not passed|Step not passed/i').count() > 0
-        finish_skipped = self._get_finish_skipped_button(target)
-        if is_unpassed and await finish_skipped.count() > 0:
-            txt = (await finish_skipped.inner_text()).strip()
-            print(f"  [Navigation] Activity/Step not passed. Clicking '{txt}' to achieve required passing score...")
-            await self.sleep_delay(0.5, 1.0)
-            try:
-                await finish_skipped.click(timeout=3000)
-            except Exception:
-                await finish_skipped.dispatch_event("click")
-            await self.sleep_delay(1.0, 1.5)
-            self._consecutive_nexts = 0
-            return True
-
-        # 5. Incomplete activity tab inside multi-activity step
+        # 6. Incomplete activity tab inside multi-activity step
         target_url = getattr(target, "url", "")
         if "lesson-player" in target_url:
             incomplete_act = self._get_incomplete_activity_button(target)
@@ -223,17 +235,6 @@ class NavigationHandler(BaseHandler):
                 await self.sleep_delay(1.0, 1.5)
                 self._consecutive_nexts = 0
                 return True
-
-        # 6. Step launcher buttons on lesson overview (e.g. "Start next step" / "Start step")
-        step_btn = self._get_step_button(target)
-        if await step_btn.count() > 0:
-            aria = await step_btn.get_attribute("aria-label") or "Next step"
-            print(f"  [Navigation] Launching step: {aria[:40]}...")
-            await self.sleep_delay(0.5, 1.0)
-            await step_btn.click()
-            await self.sleep_delay(1.0, 1.5)
-            self._consecutive_nexts = 0
-            return True
 
         # 7. Fallback Finish skipped tasks / retry (when Next is not available)
         if await finish_skipped.count() > 0:

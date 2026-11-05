@@ -114,23 +114,37 @@ class SpeakingHandler(BaseHandler):
                         sd_mc['data'] = b64
                     break
 
-        # 2. Handle pure Speaking Practice tasks (repeat-after-me speechData)
+        # 2. Handle pure Speaking Practice tasks (speakingPractice.userInput)
+        sp = resp.get('contents', {}).get('speakingPractice', {})
+        if sp and isinstance(sp, dict):
+            user_input = sp.get('userInput')
+            if isinstance(user_input, dict):
+                target_text = user_input.get('targetText') or user_input.get('text') or user_input.get('phrase')
+                if not target_text and self._last_detected_phrase:
+                    target_text = self._last_detected_phrase
+                if target_text:
+                    print(f"  [Speaking Route] Synthesizing speech for speakingPractice: '{target_text}'")
+                    b64 = self._generate_wav(target_text)
+                    if b64:
+                        user_input['data'] = b64
+                        modified = True
+
+        # 3. Handle generic speechData nodes
         nodes = self._find_speech_nodes(payload)
         for sd in nodes:
-            if not sd.get('data') or len(sd.get('data', '')) == 0:
-                chosen_phrase = ""
-                for k in ['text', 'targetText', 'expectedText', 'referenceText', 'phrase', 'sentence', 'prompt']:
-                    if k in sd and isinstance(sd[k], str) and sd[k].strip():
-                        chosen_phrase = sd[k].strip()
-                        break
-                if not chosen_phrase and self._last_detected_phrase:
-                    chosen_phrase = self._last_detected_phrase
+            chosen_phrase = ""
+            for k in ['text', 'targetText', 'expectedText', 'referenceText', 'phrase', 'sentence', 'prompt']:
+                if k in sd and isinstance(sd[k], str) and sd[k].strip():
+                    chosen_phrase = sd[k].strip()
+                    break
+            if not chosen_phrase and self._last_detected_phrase:
+                chosen_phrase = self._last_detected_phrase
 
-                if chosen_phrase:
-                    b64 = self._generate_wav(chosen_phrase)
-                    if b64:
-                        sd['data'] = b64
-                        modified = True
+            if chosen_phrase:
+                b64 = self._generate_wav(chosen_phrase)
+                if b64:
+                    sd['data'] = b64
+                    modified = True
 
         return modified
 
@@ -145,7 +159,7 @@ class SpeakingHandler(BaseHandler):
             req = route.request
             if req.method == 'POST' and 'lesson/command' in req.url:
                 post_data = req.post_data
-                if post_data and 'speechData' in post_data and 'submit-task-response' in post_data:
+                if post_data and 'submit-task-response' in post_data:
                     try:
                         payload = json.loads(post_data)
                         if self._intercept_and_synthesize_payload(payload):
