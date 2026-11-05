@@ -24,10 +24,41 @@ AUXILIARIES = {
 }
 
 def score_pair(w1: str, w2: str) -> int:
-    w1_clean = w1.rstrip(".?!,").lower()
-    w2_clean = w2.rstrip(".?!,").lower()
+    w1_clean = w1.rstrip(".?!,").lower().replace("’", "'")
+    w2_clean = w2.rstrip(".?!,").lower().replace("’", "'")
 
     score = 0
+    # Subject contractions + verbs (e.g. It'd be, I'd like, She'd love)
+    if w1_clean in {"it'd", "i'd", "you'd", "he'd", "she'd", "we'd", "they'd"}:
+        if w2_clean in {"be", "like", "love", "rather", "prefer", "have", "go", "think", "want", "appreciate"}:
+            score += 65
+        elif w2_clean not in PREPOSITIONS and w2_clean not in ARTICLES and w2_clean not in MODALS:
+            score += 35
+
+    # Predicate adjectives after "be"
+    if w1_clean in {"be", "is", "are", "was", "were", "been"} and w2_clean in {
+        "great", "good", "nice", "wonderful", "better", "best", "able", "unable",
+        "possible", "impossible", "hard", "difficult", "easy", "glad", "happy",
+        "ready", "interested", "likely", "unlikely", "sure", "certain"
+    }:
+        score += 60
+
+    # Adjectives + "to" (great to, able to, happy to, glad to, ready to, etc.)
+    if w1_clean in {
+        "great", "good", "nice", "wonderful", "better", "able", "unable",
+        "glad", "happy", "ready", "easy", "hard", "difficult", "likely",
+        "unlikely", "pleased", "free", "excited", "willing"
+    } and w2_clean == "to":
+        score += 65
+
+    # Quantifiers & noun modifiers (a lot, lot more, a bit, a few, a little, etc.)
+    if w1_clean == "a" and w2_clean in {"lot", "bit", "few", "little", "couple"}:
+        score += 65
+    elif w1_clean == "lot" and w2_clean in {"more", "of", "less"}:
+        score += 65
+    elif w1_clean in {"travel", "visit", "see", "spend", "need", "have", "take", "do", "buy", "eat", "earn"} and w2_clean in {"a", "an", "the", "more", "much", "less"}:
+        score += 40
+
     # Pronoun + Auxiliary / Modals
     if w1_clean in {"i"} and w2_clean in {"am", "was", "have", "had", "will", "would", "can", "could", "'m", "'ve", "'d", "'ll"}:
         score += 55
@@ -227,7 +258,9 @@ class SequencingHandler(BaseHandler):
                 reserved_end = end_candidates[0]
 
         # The pool of candidate tokens available for the immediate slot (next_slot = p_len)
-        pool_for_next = [w for w in words if w != reserved_end] if reserved_end else list(words)
+        pool_for_next = list(words)
+        if reserved_end and reserved_end in pool_for_next:
+            pool_for_next.remove(reserved_end)
         if not pool_for_next and reserved_end:
             pool_for_next = [reserved_end]
 
@@ -265,8 +298,9 @@ class SequencingHandler(BaseHandler):
             )
 
         candidates = []
-        for next_word in valid_next_words:
-            rest = [w for w in words if w != next_word]
+        for next_word in list(dict.fromkeys(valid_next_words)):
+            rest = list(words)
+            rest.remove(next_word)
             if reserved_end and reserved_end in rest:
                 rest.remove(reserved_end)
 
@@ -276,8 +310,9 @@ class SequencingHandler(BaseHandler):
                 r_perms = list(itertools.islice(itertools.permutations(rest), 1000))
             else:
                 perms = []
-                for r_cand in rest:
-                    rem = [w for w in rest if w != r_cand]
+                for r_cand in list(dict.fromkeys(rest)):
+                    rem = list(rest)
+                    rem.remove(r_cand)
                     chain = [r_cand]
                     curr = r_cand
                     while rem:
@@ -290,6 +325,8 @@ class SequencingHandler(BaseHandler):
 
             for r_p in r_perms:
                 suffix = [next_word] + list(r_p) + ([reserved_end] if reserved_end else [])
+                if len(suffix) != len(words):
+                    continue
                 full = tuple(prefix + suffix)
                 if full in self._failed_permutations:
                     continue
@@ -307,8 +344,9 @@ class SequencingHandler(BaseHandler):
         # Relax deeper position constraints if all candidates were pruned,
         # but NEVER relax the immediate next slot or non-failed full sequence
         if not candidates:
-            for next_word in valid_next_words:
-                rest = [w for w in words if w != next_word]
+            for next_word in list(dict.fromkeys(valid_next_words)):
+                rest = list(words)
+                rest.remove(next_word)
                 if reserved_end and reserved_end in rest:
                     rest.remove(reserved_end)
                 chain = [next_word]
@@ -320,8 +358,10 @@ class SequencingHandler(BaseHandler):
                     rem.remove(best_next)
                     curr = best_next
                 suffix = chain + ([reserved_end] if reserved_end else [])
-                if tuple(prefix + suffix) not in self._failed_permutations:
+                if len(suffix) == len(words) and tuple(prefix + suffix) not in self._failed_permutations:
                     candidates.append(suffix)
+
+        candidates = [c for c in candidates if len(c) == len(words)]
 
         def score_candidate(suffix):
             return self._score_sentence(prefix + suffix)
@@ -633,67 +673,68 @@ class SequencingHandler(BaseHandler):
         await self.sleep_delay(0.4, 0.7)
         await check_btn.click()
 
-        # Wait 0.7s for Angular assessment classes to render before Efekta's 1500ms reset timer
-        await asyncio.sleep(0.7)
+        # Dynamic poll up to 1.8s for assessment classes to render or Next button to enable
+        assessment = []
+        for _ in range(12):
+            await asyncio.sleep(0.15)
+            # Check if Next button got enabled
+            next_btn = target.locator(
+                'button[class*="next-task-button"]:not([disabled]):not(.mat-mdc-button-disabled):visible, '
+                'button.mat-mdc-unelevated-button:not([disabled]):not(.mat-mdc-button-disabled):visible:has-text("Next")'
+            ).first
+            if await next_btn.count() > 0:
+                print("  [Sequencing] Sequence accepted! Next is enabled.")
+                self._failed_permutations.clear()
+                self._invalid_token_positions.clear()
+                return True
 
-        # Check if Next button got enabled
-        next_btn = target.locator(
-            'button[class*="next-task-button"]:not([disabled]):not(.mat-mdc-button-disabled):visible, '
-            'button.mat-mdc-unelevated-button:not([disabled]):not(.mat-mdc-button-disabled):visible:has-text("Next")'
-        ).first
-        if await next_btn.count() > 0:
-            print("  [Sequencing] Sequence accepted! Next is enabled.")
-            self._failed_permutations.clear()
-            self._invalid_token_positions.clear()
-            return True
+            assessment = await target.evaluate(r'''() => {
+                const extractWord = (b) => {
+                    if (!b) return '';
+                    const el = b.querySelector('[data-qa="markdown-element-container"]');
+                    if (el) return el.textContent.trim();
+                    return (b.textContent || '').split('\n')[0].trim();
+                };
+                const isItemCorrect = (el) => {
+                    if (!el) return false;
+                    if (el.classList.contains('is-correct') || el.classList.contains('item-correct')) return true;
+                    if (el.querySelector('.is-correct, .item-correct, .correct-circle, ef-svg-thumbs-up, [id="thumbs-up"]')) return true;
+                    return false;
+                };
+                const isItemIncorrect = (el) => {
+                    if (!el) return false;
+                    if (el.classList.contains('is-incorrect') || el.classList.contains('item-incorrect')) return true;
+                    if (el.querySelector('.is-incorrect, .item-incorrect, .incorrect-circle, ef-svg-thumbs-down, [id="thumbs-down"]')) return true;
+                    return false;
+                };
+                const items = Array.from(document.querySelectorAll('.ordered-item-container > li'));
+                const orderedEls = items.length > 0 ? items : Array.from(document.querySelectorAll('.ordered-item-container ef-sequencing-tap-option-item'));
+                return orderedEls.map((el, i) => ({
+                    index: i,
+                    word: extractWord(el),
+                    isCorrect: isItemCorrect(el),
+                    isIncorrect: isItemIncorrect(el)
+                }));
+            }''')
 
-        # Read assessment from DOM elements
-        assessment = await target.evaluate(r'''() => {
-            const extractWord = (b) => {
-                if (!b) return '';
-                const el = b.querySelector('[data-qa="markdown-element-container"]');
-                if (el) return el.textContent.trim();
-                return (b.textContent || '').split('\n')[0].trim();
-            };
-            const isItemCorrect = (el) => {
-                if (!el) return false;
-                if (el.classList.contains('is-correct') || el.classList.contains('item-correct')) return true;
-                if (el.querySelector('.is-correct, .item-correct, .correct-circle, ef-svg-thumbs-up, [id="thumbs-up"]')) return true;
-                return false;
-            };
-            const isItemIncorrect = (el) => {
-                if (!el) return false;
-                if (el.classList.contains('is-incorrect') || el.classList.contains('item-incorrect')) return true;
-                if (el.querySelector('.is-incorrect, .item-incorrect, .incorrect-circle, ef-svg-thumbs-down, [id="thumbs-down"]')) return true;
-                return false;
-            };
-            const items = Array.from(document.querySelectorAll('.ordered-item-container > li'));
-            const orderedEls = items.length > 0 ? items : Array.from(document.querySelectorAll('.ordered-item-container ef-sequencing-tap-option-item'));
-            return orderedEls.map((el, i) => ({
-                index: i,
-                word: extractWord(el),
-                isCorrect: isItemCorrect(el),
-                isIncorrect: isItemIncorrect(el)
-            }));
-        }''')
+            if any(item['isCorrect'] or item['isIncorrect'] for item in assessment):
+                break
 
         self._failed_permutations.add(tuple(full_display))
 
-        # Identify the first incorrect position
+        # Identify the first incorrect position only if assessment classes rendered
         first_failed_idx = None
-        for item in assessment:
-            idx = item['index']
-            if item['isIncorrect'] or not item['isCorrect']:
-                first_failed_idx = idx
-                break
+        if any(item['isCorrect'] or item['isIncorrect'] for item in assessment):
+            for item in assessment:
+                idx = item['index']
+                if item['isIncorrect'] or not item['isCorrect']:
+                    first_failed_idx = idx
+                    break
 
         if first_failed_idx is not None and first_failed_idx < len(full_display):
             failed_word = full_display[first_failed_idx]
             self._invalid_token_positions.add((failed_word, first_failed_idx))
             print(f"  [Sequencing] Word '{failed_word}' incorrect at position {first_failed_idx}. Excluded from slot {first_failed_idx}.")
-        elif len(full_display) > 1:
-            fallback_idx = 0
-            self._invalid_token_positions.add((full_display[fallback_idx], fallback_idx))
 
         # Wait for Efekta's reset animation to complete (incorrect items are returned to unordered pool)
         for _ in range(8):

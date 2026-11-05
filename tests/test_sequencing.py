@@ -250,3 +250,19 @@ async def test_sequencing_cdk_drag_detection():
         assert can is True
 
         await browser.close()
+
+def test_sequencing_duplicate_tokens():
+    handler = SequencingHandler()
+    words = ['great', 'able', 'more.', 'It’d', 'to', 'be', 'be', 'travel', 'lot', 'to', 'a']
+    candidates = handler._get_candidate_orders(words)
+    assert len(candidates) > 0
+    # Every candidate must have all 11 tokens preserved
+    for cand in candidates:
+        assert len(cand) == len(words), f"Expected length {len(words)}, got {len(cand)}: {cand}"
+        assert cand.count('be') == 2
+        assert cand.count('to') == 2
+
+    # Top candidate should be the expected grammatical sentence
+    top = candidates[0]
+    assert top == ['It’d', 'be', 'great', 'to', 'be', 'able', 'to', 'travel', 'a', 'lot', 'more.']
+
