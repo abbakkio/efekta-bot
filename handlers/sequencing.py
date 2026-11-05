@@ -121,6 +121,9 @@ class SequencingHandler(BaseHandler):
         self._current_task_signature = None
         self._assign_index_failed_positions = set()  # set of (item_idx, pos)
         self._assign_index_task_id = None
+        self._cdk_drag_failed_permutations = set()
+        self._cdk_drag_invalid_positions = set()  # set of (text, position_idx)
+        self._cdk_drag_task_id = None
 
     def _check_task_reset(self, all_words: list[str]):
         """Resets failed permutations and position constraints when a new task is detected."""
@@ -329,36 +332,201 @@ class SequencingHandler(BaseHandler):
     async def _handle_cdk_drag(self, target: Page | Frame) -> bool:
         """Handles Angular CDK Drag and Drop column sequencing tasks."""
         page = target.page if isinstance(target, Frame) else target
-        check_btn = target.locator('button.check-task-button:not([disabled]):visible').first
-        if await check_btn.count() > 0:
-            print("  [Sequencing] Check button is enabled. Submitting sequence...")
-            await self.sleep_delay(0.5, 0.8)
-            await check_btn.click()
-            await asyncio.sleep(2.0)
-            return True
 
-        drag_items = target.locator('.cdk-drag:visible')
-        count = await drag_items.count()
-        if count <= 1:
+        # Check if already completed (Next button enabled)
+        next_btn = target.locator(
+            'button[class*="next-task-button"]:not([disabled]):not(.mat-mdc-button-disabled):visible, '
+            'button.mat-mdc-unelevated-button:not([disabled]):not(.mat-mdc-button-disabled):visible:has-text("Next")'
+        ).first
+        if await next_btn.count() > 0:
+            self._cdk_drag_failed_permutations.clear()
+            self._cdk_drag_invalid_positions.clear()
             return False
 
-        # Pick up item 0 and move it to bottom, or adjust order
-        print(f"  [Sequencing] Reordering CDK drag items (count: {count}) via keyboard...")
-        first_item = drag_items.first
-        await first_item.click()
-        await asyncio.sleep(0.3)
-        await page.keyboard.press("Space")
-        await asyncio.sleep(0.3)
-        await page.keyboard.press("ArrowDown")
-        await asyncio.sleep(0.3)
-        await page.keyboard.press("Space")
-        await asyncio.sleep(1.0)
+        # 1. Read all sort-column items
+        items = await target.evaluate(r'''() => {
+            const els = Array.from(document.querySelectorAll("ef-sequencing-sort-column-item"));
+            return els.map((el, i) => {
+                const textEl = el.querySelector('[data-qa="markdown-element-container"]');
+                const text = textEl ? textEl.innerText.trim() : (el.innerText || '').split('\n')[0].trim();
+                const isCorrect = el.classList.contains('is-correct') || !!el.querySelector('.is-correct, ef-svg-thumbs-up');
+                const isIncorrect = el.classList.contains('is-incorrect') || !!el.querySelector('.is-incorrect, ef-svg-thumbs-down');
+                const isDraggable = !!el.querySelector('.cdk-drag') || el.classList.contains('cdk-drag');
+                return { i, text, isCorrect, isIncorrect, isDraggable };
+            });
+        }''')
 
-        # Now click Check if enabled
-        if await check_btn.count() > 0:
-            print("  [Sequencing] Submitting sequence...")
+        if not items:
+            return False
+
+        # Reset state if task changed
+        task_sig = tuple(sorted([it['text'] for it in items]))
+        if self._cdk_drag_task_id != task_sig:
+            self._cdk_drag_task_id = task_sig
+            self._cdk_drag_failed_permutations.clear()
+            self._cdk_drag_invalid_positions.clear()
+
+        # Record invalid positions from current assessment
+        for it in items:
+            if it['isIncorrect']:
+                self._cdk_drag_invalid_positions.add((it['text'], it['i']))
+
+        # Check button locator
+        check_btn = target.locator('button.check-task-button:not([disabled]):not(.mat-mdc-button-disabled):visible').first
+
+        # If all items are correct, click check or next
+        if all(it['isCorrect'] for it in items):
+            if await check_btn.count() > 0:
+                await check_btn.click()
+                await asyncio.sleep(1.5)
+            return True
+
+        # Unlocked items that can be reordered
+        unlocked_items = [it for it in items if not it['isCorrect'] and it['isDraggable']]
+        if not unlocked_items:
+            if await check_btn.count() > 0:
+                await check_btn.click()
+                await asyncio.sleep(1.5)
+                return True
+            return False
+
+        unlocked_indices = [it['i'] for it in unlocked_items]
+        unlocked_texts = [it['text'] for it in unlocked_items]
+
+        # Current full order
+        current_full = tuple([it['text'] for it in items])
+
+        # If Check button is ALREADY enabled and current_full has not failed yet, submit it
+        if await check_btn.count() > 0 and current_full not in self._cdk_drag_failed_permutations:
+            print(f"  [Sequencing] Submitting CDK column sequence: {current_full}...")
+            self._cdk_drag_failed_permutations.add(current_full)
             await check_btn.click()
-            await asyncio.sleep(2.0)
+            await asyncio.sleep(1.5)
+
+            # Read feedback immediately
+            res = await target.evaluate(r'''() => {
+                const els = Array.from(document.querySelectorAll("ef-sequencing-sort-column-item"));
+                return els.map((el, i) => {
+                    const textEl = el.querySelector('[data-qa="markdown-element-container"]');
+                    const text = textEl ? textEl.innerText.trim() : (el.innerText || '').split('\n')[0].trim();
+                    const isIncorrect = el.classList.contains('is-incorrect') || !!el.querySelector('.is-incorrect, ef-svg-thumbs-down');
+                    return { i, text, isIncorrect };
+                });
+            }''')
+            for r in res:
+                if r['isIncorrect']:
+                    self._cdk_drag_invalid_positions.add((r['text'], r['i']))
+            return True
+
+        # Find best permutation of unlocked texts
+        valid_perms = []
+        for perm in itertools.permutations(unlocked_texts):
+            full_cand = list([it['text'] for it in items])
+            for u_idx, text in zip(unlocked_indices, perm):
+                full_cand[u_idx] = text
+            full_cand = tuple(full_cand)
+            if full_cand in self._cdk_drag_failed_permutations:
+                continue
+            if any((perm[j], unlocked_indices[j]) in self._cdk_drag_invalid_positions for j in range(len(perm))):
+                continue
+            valid_perms.append(perm)
+
+        chosen_perm = valid_perms[0] if valid_perms else (
+            [p for p in itertools.permutations(unlocked_texts) if tuple(
+                [p[unlocked_indices.index(it['i'])] if it['i'] in unlocked_indices else it['text'] for it in items]
+            ) not in self._cdk_drag_failed_permutations] or list(itertools.permutations(unlocked_texts))
+        )[0]
+
+        # Reorder draggable items to match chosen_perm
+        drags_info = await target.evaluate(r'''() => {
+            return Array.from(document.querySelectorAll(".cdk-drag")).map((el, i) => {
+                const r = el.getBoundingClientRect();
+                const textEl = el.querySelector('[data-qa="markdown-element-container"]');
+                const text = textEl ? textEl.innerText.trim() : (el.innerText || '').split('\n')[0].trim();
+                return {
+                    i,
+                    text,
+                    rect: { x: r.x, y: r.y, w: r.width, h: r.height }
+                };
+            });
+        }''')
+
+        if len(drags_info) >= 2:
+            frame_offset_x = 0
+            frame_offset_y = 0
+            if isinstance(target, Frame):
+                frame_box = await page.locator("iframe").first.bounding_box()
+                if frame_box:
+                    frame_offset_x = frame_box["x"]
+                    frame_offset_y = frame_box["y"]
+
+            curr_drag_texts = [d['text'] for d in drags_info]
+            target_drag_texts = list(chosen_perm)
+
+            # Move elements that are out of order
+            for target_idx, target_text in enumerate(target_drag_texts):
+                if target_text not in curr_drag_texts:
+                    continue
+                current_idx = curr_drag_texts.index(target_text)
+                if current_idx != target_idx:
+                    src_d = drags_info[current_idx]
+                    dst_d = drags_info[target_idx]
+
+                    src_x = frame_offset_x + src_d["rect"]["x"] + src_d["rect"]["w"] / 2
+                    src_y = frame_offset_y + src_d["rect"]["y"] + src_d["rect"]["h"] / 2
+
+                    dst_x = frame_offset_x + dst_d["rect"]["x"] + dst_d["rect"]["w"] / 2
+                    if target_idx < current_idx:
+                        dst_y = frame_offset_y + dst_d["rect"]["y"] - 15
+                    else:
+                        dst_y = frame_offset_y + dst_d["rect"]["y"] + dst_d["rect"]["h"] + 15
+
+                    print(f"  [Sequencing] Dragging '{target_text}' from position {current_idx} to {target_idx}...")
+                    await page.mouse.move(src_x, src_y)
+                    await page.mouse.down()
+                    await asyncio.sleep(0.15)
+                    steps = 20
+                    for s in range(1, steps + 1):
+                        curr_x = src_x + (dst_x - src_x) * (s / steps)
+                        curr_y = src_y + (dst_y - src_y) * (s / steps)
+                        await page.mouse.move(curr_x, curr_y)
+                        await asyncio.sleep(0.015)
+                    await asyncio.sleep(0.2)
+                    await page.mouse.up()
+                    await asyncio.sleep(1.0)
+                    break
+
+        # Submit if Check button is enabled
+        check_btn = target.locator('button.check-task-button:not([disabled]):not(.mat-mdc-button-disabled):visible').first
+        if await check_btn.count() > 0:
+            new_items = await target.evaluate(r'''() => {
+                const els = Array.from(document.querySelectorAll("ef-sequencing-sort-column-item"));
+                return els.map(el => {
+                    const textEl = el.querySelector('[data-qa="markdown-element-container"]');
+                    return textEl ? textEl.innerText.trim() : (el.innerText || '').split('\n')[0].trim();
+                });
+            }''')
+            full_perm = tuple(new_items)
+            print(f"  [Sequencing] Submitting sequence: {full_perm}...")
+            self._cdk_drag_failed_permutations.add(full_perm)
+            await check_btn.click()
+            await asyncio.sleep(1.5)
+
+            # Read feedback
+            res = await target.evaluate(r'''() => {
+                const els = Array.from(document.querySelectorAll("ef-sequencing-sort-column-item"));
+                return els.map((el, i) => {
+                    const textEl = el.querySelector('[data-qa="markdown-element-container"]');
+                    const text = textEl ? textEl.innerText.trim() : (el.innerText || '').split('\n')[0].trim();
+                    const isIncorrect = el.classList.contains('is-incorrect') || !!el.querySelector('.is-incorrect, ef-svg-thumbs-down');
+                    return { i, text, isIncorrect };
+                });
+            }''')
+            for r in res:
+                if r['isIncorrect']:
+                    self._cdk_drag_invalid_positions.add((r['text'], r['i']))
+            return True
+
         return True
 
     async def _handle_assign_index(self, target: Page | Frame) -> bool:

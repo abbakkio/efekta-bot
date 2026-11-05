@@ -217,3 +217,36 @@ def test_sequencing_single_punctuation_reserved_for_end():
     for cand in candidates:
         assert cand[-1] == "free.", f"Expected 'free.' at the end of suffix: {cand}"
         assert cand[0] != "free.", f"'free.' should never be immediate candidate at slot 1: {cand}"
+
+@pytest.mark.asyncio
+async def test_sequencing_cdk_drag_detection():
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(headless=True, channel="chrome")
+        page = await browser.new_page()
+
+        await page.set_content("""
+        <html>
+        <body>
+            <ef-sequencing-sort-column-task>
+                <div class="cdk-drop-list">
+                    <ef-sequencing-sort-column-item>
+                        <div class="list-item is-correct"><span data-qa="markdown-element-container">A</span></div>
+                    </ef-sequencing-sort-column-item>
+                    <ef-sequencing-sort-column-item>
+                        <div class="cdk-drag list-item"><span data-qa="markdown-element-container">B</span></div>
+                    </ef-sequencing-sort-column-item>
+                    <ef-sequencing-sort-column-item>
+                        <div class="cdk-drag list-item"><span data-qa="markdown-element-container">C</span></div>
+                    </ef-sequencing-sort-column-item>
+                </div>
+            </ef-sequencing-sort-column-task>
+            <button class="check-task-button" disabled>Check</button>
+        </body>
+        </html>
+        """)
+
+        handler = SequencingHandler()
+        can = await handler.can_handle(page)
+        assert can is True
+
+        await browser.close()
