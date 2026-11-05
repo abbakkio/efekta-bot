@@ -39,20 +39,34 @@ def score_pair(w1: str, w2: str) -> int:
     # Subject pronoun + 3rd person singular verb (e.g. She hopes, He plans, She wants)
     if w1_clean in {"he", "she", "it"} and (w2_clean.endswith("s") or w2_clean.endswith("es")) and w2_clean not in {"is", "was", "has"}:
         score += 50
-    elif w1_clean in {"i", "we", "they", "you"} and w2_clean in {"hope", "plan", "want", "intend", "think", "believe", "decide", "like", "need"}:
+    elif w1_clean in {"i", "we", "they", "you"} and w2_clean in {"hope", "plan", "want", "intend", "think", "believe", "decide", "like", "need", "seem", "appear", "look", "sound", "feel", "know", "mean", "tend"}:
         score += 50
 
-    # Auxiliary + -ing verb (e.g. am looking, is planning, was hoping)
-    if w1_clean in {"am", "is", "are", "was", "were"} and w2_clean.endswith("ing"):
+    # Auxiliary + -ing verb (e.g. am looking, is planning, was hoping, be getting)
+    if w1_clean in {"am", "is", "are", "was", "were", "be", "been"} and w2_clean.endswith("ing"):
         score += 50
 
-    # Verbal expressions + "to" (looking to, planning to, intend to, decided to, want to, etc.)
-    if w1_clean in {"looking", "planning", "going", "hoping", "trying", "hope", "hopes", "plan", "plans", "want", "wants", "wanted", "intend", "intends", "intended", "decide", "decides", "decided", "like", "likes", "need", "needs", "needed", "able", "expected"} and w2_clean == "to":
+    # Verbal expressions + "to" (looking to, planning to, intend to, decided to, want to, seem to, etc.)
+    if w1_clean in {"looking", "planning", "going", "hoping", "trying", "hope", "hopes", "plan", "plans", "want", "wants", "wanted", "intend", "intends", "intended", "decide", "decides", "decided", "like", "likes", "need", "needs", "needed", "able", "expected", "seem", "seems", "seemed", "appear", "appears", "appeared", "tend", "tends", "claim", "claims", "happen", "happens"} and w2_clean == "to":
         score += 60
 
     # "to" + infinitive base verb (to increase, to improve, to move, to leave, etc.)
     if w1_clean == "to" and w2_clean in {"increase", "improve", "learn", "change", "make", "get", "take", "find", "apply", "start", "become", "continue", "develop", "lose", "do", "go", "eat", "be", "work", "relax", "exercise", "see", "help", "travel", "study", "move", "leave", "stay", "join", "accept", "quit", "retire", "buy", "sell", "live"}:
         score += 60
+
+    # Phrasal verbs and collocations (getting on, each other, well with, etc.)
+    if w1_clean in {"get", "gets", "getting", "got"} and w2_clean in {"on", "in", "up", "along", "with", "out", "off", "back", "away", "over", "through", "together"}:
+        score += 55
+    elif w1_clean == "on" and w2_clean in {"well", "badly", "time"}:
+        score += 45
+    elif w1_clean == "well" and w2_clean in {"with", "at", "for"}:
+        score += 45
+    elif w1_clean == "each" and w2_clean.startswith("other"):
+        score += 60
+    elif w1_clean == "one" and w2_clean.startswith("another"):
+        score += 60
+    elif w1_clean == "with" and w2_clean in {"each", "one", "all", "them", "us", "him", "her", "me", "you"}:
+        score += 45
 
     # Verb + preposition (move into, apply for, look at, etc.)
     if w1_clean in {"move", "moved"} and w2_clean == "into":
@@ -215,53 +229,97 @@ class SequencingHandler(BaseHandler):
         if end and end in mid_copy:
             mid_copy.remove(end)
 
-        middle = mid_copy
-        # If middle has more than 7 tokens, limit to first 5000 permutations for snappy response
-        if len(middle) > 7:
-            perms = list(itertools.islice(itertools.permutations(middle), 5000))
-        else:
-            perms = list(itertools.permutations(middle))
+        if not mid_copy:
+            suffix = ([start] if start else []) + ([end] if end else [])
+            return [suffix] if tuple(prefix + suffix) not in self._failed_permutations else []
 
-        def make_suffix(perm):
-            return ([start] if start else []) + list(perm) + ([end] if end else [])
+        # Determine the immediate slot index after locked prefix (and start token if present)
+        next_slot = p_len + (1 if start else 0)
 
-        candidates = [make_suffix(p) for p in perms]
+        # STRICT DEDUCTIVE PRUNING:
+        # Candidate words for next_slot must NOT have failed at next_slot
+        valid_next_words = [w for w in mid_copy if (w, next_slot) not in self._invalid_token_positions]
+        if not valid_next_words:
+            # Fallback only if every word has been marked invalid
+            valid_next_words = list(mid_copy)
 
-        def is_valid_candidate(suffix: list[str], strict_all: bool = True) -> bool:
-            full = tuple(prefix + suffix)
-            if full in self._failed_permutations:
-                return False
+        # Sort valid_next_words by linguistic likelihood following the preceding token
+        prev_word = start if start else (prefix[-1] if prefix else None)
+        if prev_word:
+            valid_next_words.sort(
+                key=lambda w: (
+                    score_pair(prev_word, w),
+                    self._score_sentence(prefix + ([start] if start else []) + [w])
+                ),
+                reverse=True
+            )
 
-            if strict_all:
+        candidates = []
+        for next_word in valid_next_words:
+            rest = [w for w in mid_copy if w != next_word]
+
+            if len(rest) <= 6:
+                r_perms = list(itertools.permutations(rest))
+            elif len(rest) == 7:
+                r_perms = list(itertools.islice(itertools.permutations(rest), 1000))
+            else:
+                # Greedy chains starting with each member of rest
+                perms = []
+                for r_cand in rest:
+                    rem = [w for w in rest if w != r_cand]
+                    chain = [r_cand]
+                    curr = r_cand
+                    while rem:
+                        best_next = max(rem, key=lambda w: score_pair(curr, w))
+                        chain.append(best_next)
+                        rem.remove(best_next)
+                        curr = best_next
+                    perms.append(tuple(chain))
+                r_perms = perms
+
+            for r_p in r_perms:
+                suffix = ([start] if start else []) + [next_word] + list(r_p) + ([end] if end else [])
+                full = tuple(prefix + suffix)
+                if full in self._failed_permutations:
+                    continue
+
+                # Check all token position constraints
+                violates = False
                 for j, w in enumerate(suffix):
                     abs_pos = p_len + j
                     if (w, abs_pos) in self._invalid_token_positions:
-                        return False
-            else:
-                # Relaxed: strictly enforce immediate next position
-                if suffix and (suffix[0], p_len) in self._invalid_token_positions:
-                    return False
-            return True
+                        violates = True
+                        break
+                if not violates:
+                    candidates.append(suffix)
 
-        # 1. Filter candidates that satisfy all position constraints and haven't failed
-        valid = [c for c in candidates if is_valid_candidate(c, strict_all=True)]
-        if not valid:
-            valid = [c for c in candidates if is_valid_candidate(c, strict_all=False)]
-        if not valid:
-            valid = [c for c in candidates if tuple(prefix + c) not in self._failed_permutations]
-
-        candidates_to_sort = valid if valid else candidates
+        # Relax deeper position constraints if all candidates were pruned,
+        # but NEVER relax the immediate next slot or non-failed full sequence
+        if not candidates:
+            for next_word in valid_next_words:
+                rest = [w for w in mid_copy if w != next_word]
+                chain = [next_word]
+                rem = list(rest)
+                curr = next_word
+                while rem:
+                    best_next = max(rem, key=lambda w: score_pair(curr, w))
+                    chain.append(best_next)
+                    rem.remove(best_next)
+                    curr = best_next
+                suffix = ([start] if start else []) + chain + ([end] if end else [])
+                if tuple(prefix + suffix) not in self._failed_permutations:
+                    candidates.append(suffix)
 
         def score_candidate(suffix):
             full_seq = prefix + suffix
             score = self._score_sentence(full_seq)
-            # Prioritize candidates whose immediate next word is untried at this slot
+            # Heavy bonus if the immediate next token is untried at this position
             if suffix and (suffix[0], p_len) not in self._invalid_token_positions:
-                score += 150
+                score += 500
             return score
 
-        candidates_to_sort.sort(key=score_candidate, reverse=True)
-        return candidates_to_sort
+        candidates.sort(key=score_candidate, reverse=True)
+        return candidates
 
     async def _handle_cdk_drag(self, target: Page | Frame) -> bool:
         """Handles Angular CDK Drag and Drop column sequencing tasks."""
@@ -421,8 +479,8 @@ class SequencingHandler(BaseHandler):
             const extractWord = (b) => {
                 if (!b) return '';
                 const el = b.querySelector('[data-qa="markdown-element-container"]');
-                if (el) return el.innerText.trim();
-                return (b.innerText || '').split('\n')[0].trim();
+                if (el) return el.textContent.trim();
+                return (b.textContent || '').split('\n')[0].trim();
             };
             const isItemCorrect = (el) => {
                 if (!el) return false;
@@ -436,9 +494,8 @@ class SequencingHandler(BaseHandler):
                 if (el.querySelector('.is-incorrect, .item-incorrect, .incorrect-circle, ef-svg-thumbs-down, [id="thumbs-down"]')) return true;
                 return false;
             };
-            const orderedEls = Array.from(document.querySelectorAll(
-                '.ordered-item-container > li, .ordered-item-container ef-sequencing-tap-option-item'
-            ));
+            const items = Array.from(document.querySelectorAll('.ordered-item-container > li'));
+            const orderedEls = items.length > 0 ? items : Array.from(document.querySelectorAll('.ordered-item-container ef-sequencing-tap-option-item'));
             return orderedEls.map((el, i) => ({
                 index: i,
                 word: extractWord(el),
@@ -499,15 +556,17 @@ class SequencingHandler(BaseHandler):
 
         # Collect all words in the exercise to detect task changes
         all_words = await target.evaluate(r'''() => {
+            const words = Array.from(document.querySelectorAll('.unordered-item-container [data-qa="markdown-element-container"]')).map(el => el.textContent.trim()).filter(Boolean);
+            if (words.length > 0) return words;
             const extractWord = (b) => {
                 if (!b) return '';
                 const el = b.querySelector('[data-qa="markdown-element-container"]');
-                if (el) return el.innerText.trim();
-                return (b.innerText || '').split('\n')[0].trim();
+                if (el) return el.textContent.trim();
+                return (b.textContent || '').split('\n')[0].trim();
             };
-            const ordered = Array.from(document.querySelectorAll(
-                '.ordered-item-container > li, .ordered-item-container ef-sequencing-tap-option-item, .ordered-item-container .item'
-            )).map(extractWord);
+            const items = Array.from(document.querySelectorAll('.ordered-item-container > li'));
+            const orderedEls = items.length > 0 ? items : Array.from(document.querySelectorAll('.ordered-item-container ef-sequencing-tap-option-item'));
+            const ordered = orderedEls.map(extractWord);
             const unordered = Array.from(document.querySelectorAll('.unordered-item-container button')).map(extractWord);
             return [...ordered, ...unordered].filter(Boolean);
         }''')
@@ -518,8 +577,8 @@ class SequencingHandler(BaseHandler):
             const extractWord = (b) => {
                 if (!b) return '';
                 const el = b.querySelector('[data-qa="markdown-element-container"]');
-                if (el) return el.innerText.trim();
-                return (b.innerText || '').split('\n')[0].trim();
+                if (el) return el.textContent.trim();
+                return (b.textContent || '').split('\n')[0].trim();
             };
             const isItemCorrect = (el) => {
                 if (!el) return false;
@@ -528,9 +587,8 @@ class SequencingHandler(BaseHandler):
                 return false;
             };
 
-            const orderedEls = Array.from(document.querySelectorAll(
-                '.ordered-item-container > li, .ordered-item-container ef-sequencing-tap-option-item'
-            ));
+            const items = Array.from(document.querySelectorAll('.ordered-item-container > li'));
+            const orderedEls = items.length > 0 ? items : Array.from(document.querySelectorAll('.ordered-item-container ef-sequencing-tap-option-item'));
 
             // STRICT CONTINUOUS PREFIX from index 0:
             // Stop immediately at the first non-correct element so that any words after a gap are NOT locked.
@@ -589,8 +647,8 @@ class SequencingHandler(BaseHandler):
             const extractWord = (b) => {
                 if (!b) return '';
                 const el = b.querySelector('[data-qa="markdown-element-container"]');
-                if (el) return el.innerText.trim();
-                return (b.innerText || '').split('\n')[0].trim();
+                if (el) return el.textContent.trim();
+                return (b.textContent || '').split('\n')[0].trim();
             };
             return Array.from(document.querySelectorAll('.unordered-item-container button:not(.is-hidden):not([hidden])'))
                 .filter(b => b.offsetParent !== null && !b.classList.contains('is-hidden') && !b.hasAttribute('hidden'))
@@ -619,8 +677,8 @@ class SequencingHandler(BaseHandler):
                 const extractWord = (b) => {
                     if (!b) return '';
                     const el = b.querySelector('[data-qa="markdown-element-container"]');
-                    if (el) return el.innerText.trim();
-                    return (b.innerText || '').split('\n')[0].trim();
+                    if (el) return el.textContent.trim();
+                    return (b.textContent || '').split('\n')[0].trim();
                 };
                 const btns = Array.from(document.querySelectorAll(
                     '.unordered-item-container button:not(.is-hidden):not([hidden])'

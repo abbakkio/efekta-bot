@@ -110,9 +110,8 @@ async def test_sequencing_dom_continuous_prefix_gap():
                 return false;
             };
 
-            const orderedEls = Array.from(document.querySelectorAll(
-                '.ordered-item-container > li, .ordered-item-container ef-sequencing-tap-option-item'
-            ));
+            const items = Array.from(document.querySelectorAll('.ordered-item-container > li'));
+            const orderedEls = items.length > 0 ? items : Array.from(document.querySelectorAll('.ordered-item-container ef-sequencing-tap-option-item'));
 
             const lockedPrefix = [];
             for (let i = 0; i < orderedEls.length; i++) {
@@ -128,5 +127,57 @@ async def test_sequencing_dom_continuous_prefix_gap():
 
         # Strictly only ["I"] should be locked, NOT ["I", "soon."]!
         assert state["lockedPrefix"] == ["I"], f"Expected lockedPrefix to be ['I'], got {state['lockedPrefix']}"
+
+        await browser.close()
+
+def test_sequencing_large_pool_pruning():
+    handler = SequencingHandler()
+    words = ['with', 'getting', 'to', 'be', 'well', 'on', 'seem', 'each', 'other.']
+    prefix = ['They']
+
+    # Mark 'with' as invalid at position 1 (right after prefix 'They')
+    handler._invalid_token_positions.add(('with', 1))
+
+    candidates = handler._get_candidate_orders(words, prefix=prefix)
+    assert len(candidates) > 0, "Expected candidate orders to be generated"
+    for cand in candidates:
+        assert cand[0] != 'with', f"Found candidate with 'with' at slot 1: {prefix + cand}"
+
+@pytest.mark.asyncio
+async def test_sequencing_dom_nested_item_no_duplication():
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(headless=True, channel="chrome")
+        page = await browser.new_page()
+
+        html_content = """
+        <!DOCTYPE html>
+        <html>
+        <body>
+            <ef-sequencing-tap-option-task>
+                <ol class="ordered-item-container">
+                    <li><ef-sequencing-tap-option-item><span class="item is-correct"><span data-qa="markdown-element-container">They</span></span></ef-sequencing-tap-option-item></li>
+                    <li><ef-sequencing-tap-option-item><button class="item is-unassessed"><span data-qa="markdown-element-container">with</span></button></ef-sequencing-tap-option-item></li>
+                </ol>
+            </ef-sequencing-tap-option-task>
+        </body>
+        </html>
+        """
+        await page.set_content(html_content)
+
+        state = await page.evaluate(r'''() => {
+            const extractWord = (b) => {
+                if (!b) return '';
+                const el = b.querySelector('[data-qa="markdown-element-container"]');
+                if (el) return el.textContent.trim();
+                return (b.textContent || '').split('\n')[0].trim();
+            };
+            const items = Array.from(document.querySelectorAll('.ordered-item-container > li'));
+            const orderedEls = items.length > 0 ? items : Array.from(document.querySelectorAll('.ordered-item-container ef-sequencing-tap-option-item'));
+            return orderedEls.map(extractWord);
+        }''')
+
+        # Strictly 2 elements, not 4 (no parent + child duplication)!
+        assert len(state) == 2, f"Expected 2 ordered elements, got {len(state)}: {state}"
+        assert state == ["They", "with"]
 
         await browser.close()
