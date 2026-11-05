@@ -11,7 +11,10 @@ class GapFillHandler(BaseHandler):
         self._last_blanks_count = -1
 
     def _get_available_drawer_options(self, target: Page | Frame):
-        return target.locator(".drawer-option:not([class*='incorrect']):not([aria-disabled='true']):visible")
+        return target.locator(
+            ".drawer-option:not(.disabled):not([class*='disabled']):not([class*='incorrect']):not([aria-disabled='true']):visible, "
+            ".drawer-option.deselected:not(.disabled):visible"
+        )
 
     def _get_blanks(self, target: Page | Frame):
         return target.locator(".selection-gap-button:not([disabled]):visible, [aria-label*='Blank' i]:not([disabled]):visible")
@@ -53,7 +56,13 @@ class GapFillHandler(BaseHandler):
             txt = (await opt.inner_text()).replace("\n", " ").strip()
             print(f"  [GapFill] Selecting option [{idx+1}/{opts_count}]: {txt[:30]}...")
             await self.sleep_delay(0.4, 0.7)
-            await opt.click()
+            try:
+                await opt.click(timeout=3000)
+            except Exception:
+                try:
+                    await opt.dispatch_event("click", timeout=3000)
+                except Exception:
+                    pass
             self._attempt_idx += 1
             await asyncio.sleep(1.2)
             return True
@@ -64,7 +73,13 @@ class GapFillHandler(BaseHandler):
             print(f"  [GapFill] Opening blank (remaining: {blanks_count})...")
             await blank.scroll_into_view_if_needed()
             await self.sleep_delay(0.4, 0.6)
-            await blank.click()
+            try:
+                await blank.click(timeout=3000)
+            except Exception:
+                try:
+                    await blank.dispatch_event("click", timeout=3000)
+                except Exception:
+                    pass
             await asyncio.sleep(1.0)
             return True
 
