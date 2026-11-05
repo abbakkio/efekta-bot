@@ -50,3 +50,56 @@ async def test_full_unit_automation_end_to_end(tmp_path):
             await context.close()
     finally:
         await runner.cleanup()
+
+@pytest.mark.asyncio
+async def test_get_current_level_detection():
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(headless=True, channel="chrome")
+        page = await browser.new_page()
+
+        # Mock page with Level 9 button
+        await page.set_content("""
+        <html>
+        <body>
+            <button data-id="level-view-header-change-level-btn"><span>Level 9</span></button>
+        </body>
+        </html>
+        """)
+        level = await bot.get_current_level(page)
+        assert level == "Level 9"
+
+        # Mock page with Level 10 heading
+        await page.set_content("""
+        <html>
+        <body>
+            <h1>LEVEL 10 - UPPER INTERMEDIATE</h1>
+        </body>
+        </html>
+        """)
+        level2 = await bot.get_current_level(page)
+        assert "Level 10" in level2
+
+        await browser.close()
+
+@pytest.mark.asyncio
+async def test_dashboard_progress_calculation():
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(headless=True, channel="chrome")
+        page = await browser.new_page()
+
+        # 4 cards: 2 completed, 2 incomplete
+        await page.set_content("""
+        <html>
+        <body>
+            <div data-id="lesson-card-1"><span data-id="lesson-card-1-state-icon"></span></div>
+            <div data-id="lesson-card-2"><span data-id="lesson-card-2-state-icon"></span></div>
+            <div data-id="lesson-card-3"></div>
+            <div data-id="lesson-card-4"><span data-id="lesson-card-4-lock-icon"></span></div>
+        </body>
+        </html>
+        """)
+        completed, total = await bot.get_dashboard_progress(page)
+        assert total == 4
+        assert completed == 2
+
+        await browser.close()

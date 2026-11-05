@@ -244,6 +244,96 @@ async def solve_step(scope, handlers: list) -> bool:
             print(f"  [Handler Error] {handler.__class__.__name__}: {e}")
     return False
 
+async def get_current_level(page: Page) -> str:
+    """Detects current active level from the page header or content."""
+    try:
+        level_str = await page.evaluate(r'''() => {
+            const btn = document.querySelector('[data-id="level-view-header-change-level-btn"]');
+            if (btn && btn.innerText.trim()) return btn.innerText.trim();
+            const h1 = document.querySelector('h1');
+            if (h1 && /Level\s+\d+/i.test(h1.innerText)) {
+                const m = h1.innerText.match(/Level\s+\d+/i);
+                if (m) return m[0];
+            }
+            const el = Array.from(document.querySelectorAll('span, button, h2, h3, div')).find(
+                e => e.children.length === 0 && /^Level\s+\d+$/i.test((e.innerText || '').trim())
+            );
+            if (el) return el.innerText.trim();
+            return '';
+        }''')
+        if level_str:
+            import re
+            m = re.search(r'Level\s+(\d+)', level_str, re.IGNORECASE)
+            if m:
+                return f"Level {m.group(1)}"
+            return level_str.strip().title()
+        return "Active Level"
+    except Exception:
+        return "Active Level"
+
+async def advance_to_next_level(page: Page) -> bool:
+    """Navigates to change-level and advances to the next sequential level if available."""
+    try:
+        import re
+        curr_level = await get_current_level(page)
+        m = re.search(r'\d+', curr_level)
+        if not m:
+            return False
+        curr_num = int(m.group(0))
+        next_num = curr_num + 1
+
+        print(f"[*] Attempting to advance from Level {curr_num} to Level {next_num}...")
+
+        # Open change-level page via header button or direct URL
+        change_btn = page.locator('[data-id="level-view-header-change-level-btn"]').first
+        if await change_btn.count() > 0:
+            await page.evaluate("() => document.querySelector('[data-id=\"level-view-header-change-level-btn\"]')?.click()")
+            await asyncio.sleep(2.0)
+        else:
+            await page.goto("https://learn.better.efekta.com/gap/ui/self-study/change-level")
+            await asyncio.sleep(2.0)
+
+        # Look for Level {next_num} card and select it
+        target_card_found = await page.evaluate(r'''(targetNum) => {
+            const spans = Array.from(document.querySelectorAll('span, div')).filter(
+                s => s.innerText.trim().toUpperCase() === `LEVEL ${targetNum}`
+            );
+            for (const s of spans) {
+                const card = s.closest('[role="radio"], [role="button"], button, div[tabindex]');
+                if (card) {
+                    card.click();
+                    return true;
+                }
+            }
+            return false;
+        }''', next_num)
+
+        if not target_card_found:
+            print(f"[!] Level {next_num} card not found or locked.")
+            await page.goto("https://learn.better.efekta.com/gap/ui/self-study")
+            await asyncio.sleep(2.0)
+            return False
+
+        await asyncio.sleep(1.0)
+        confirm_btn = page.locator('[data-id="selfStudy-page-change-level-confirm-btn"]').first
+        if await confirm_btn.count() > 0:
+            await confirm_btn.click()
+            await asyncio.sleep(3.0)
+            new_level = await get_current_level(page)
+            print(f"[+] Successfully transitioned to {new_level}!")
+            return True
+
+        await page.goto("https://learn.better.efekta.com/gap/ui/self-study")
+        await asyncio.sleep(2.0)
+        return False
+    except Exception as e:
+        print(f"[!] Error advancing to next level: {e}")
+        try:
+            await page.goto("https://learn.better.efekta.com/gap/ui/self-study")
+        except Exception:
+            pass
+        return False
+
 async def get_dashboard_progress(page: Page) -> tuple[int, int]:
     """Returns (completed_lessons, total_lessons) across all units on the dashboard."""
     try:
@@ -262,8 +352,14 @@ async def get_dashboard_progress(page: Page) -> tuple[int, int]:
     except Exception:
         return 0, 0
 
-async def solve_unit(initial_page: Page, context: BrowserContext, target_completed_lessons: int = 24, max_steps: int = 3500) -> bool:
-    """State machine loop that solves lessons sequentially until target units/lessons (Units 1-6) are complete."""
+async def solve_unit(
+    initial_page: Page,
+    context: BrowserContext,
+    target_completed_lessons: int | None = None,
+    max_steps: int = 10000,
+    continuous_levels: bool = True
+) -> bool:
+    """State machine loop that solves lessons sequentially for the active difficulty level (and subsequent levels if continuous)."""
     speaking_handler = SpeakingHandler()
     await speaking_handler.setup_context_routing(context)
 
@@ -281,19 +377,32 @@ async def solve_unit(initial_page: Page, context: BrowserContext, target_complet
         NavigationHandler(),
     ]
 
-    print(f"[*] Starting autonomous multi-unit solver loop (target: {target_completed_lessons} lessons through Unit 6)...")
+    initial_level = await get_current_level(initial_page)
+    goal_desc = f"target: {target_completed_lessons} lessons" if target_completed_lessons else "continuous active level mode"
+    print(f"[*] Starting autonomous solver loop on {initial_level} ({goal_desc})...")
     idle_count = 0
 
     for step in range(1, max_steps + 1):
         target_page = get_active_target_page(context, initial_page)
 
-        # 1. If on dashboard, check overall progress
+        # 1. If on dashboard, check overall progress for the active level
         if "self-study" in target_page.url.lower() and "lesson-view" not in target_page.url.lower():
             completed, total = await get_dashboard_progress(target_page)
+            curr_level = await get_current_level(target_page)
+
             if total > 0:
-                print(f"[*] Dashboard Progress: {completed}/{total} lessons completed (Goal: {target_completed_lessons}).")
-                if completed >= target_completed_lessons:
-                    print(f"[🎉] CONGRATULATIONS! Reached target progress: {completed}/{total} lessons completed through Unit 6!")
+                print(f"[*] Dashboard Progress [{curr_level}]: {completed}/{total} lessons completed.")
+                if target_completed_lessons and completed >= target_completed_lessons:
+                    print(f"[🎉] Reached target progress: {completed}/{total} lessons completed!")
+                    return True
+                elif completed >= total:
+                    print(f"[🎉] CONGRATULATIONS! All {completed}/{total} lessons completed for {curr_level}!")
+                    if continuous_levels:
+                        advanced = await advance_to_next_level(target_page)
+                        if advanced:
+                            idle_count = 0
+                            await asyncio.sleep(2.0)
+                            continue
                     return True
 
             if await enter_lesson_if_on_dashboard(target_page, context):
@@ -308,8 +417,9 @@ async def solve_unit(initial_page: Page, context: BrowserContext, target_complet
             ).first
             if await finish_indicator.count() > 0 and await finish_indicator.is_visible():
                 completed, total = await get_dashboard_progress(target_page)
-                if total > 0 and completed < target_completed_lessons:
-                    print(f"[*] Unit completion banner detected ({completed}/{target_completed_lessons}). Advancing to next lesson...")
+                curr_level = await get_current_level(target_page)
+                if total > 0 and completed < total:
+                    print(f"[*] Unit completion banner detected [{curr_level} ({completed}/{total})]. Advancing to next lesson...")
                     close_btn = target_page.locator('button:has-text("Back to"), button:has-text("Continue"), [aria-label*="close" i]').first
                     if await close_btn.count() > 0:
                         await close_btn.click()
