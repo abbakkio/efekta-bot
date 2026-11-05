@@ -452,8 +452,8 @@ class SpeakingHandler(BaseHandler):
                 self._task_attempts[phrase_key] = attempts + 1
                 return True
 
-            # 4. Trigger new recording attempt
-            if not is_evaluated_incorrect:
+            # 4. Trigger new recording attempt (for fresh task or next MC option)
+            if not is_evaluated_incorrect or is_mc_speech:
                 print("  [Speaking] Triggering recording...")
                 try:
                     await rec_btn.click(timeout=3000)
@@ -484,9 +484,9 @@ class SpeakingHandler(BaseHandler):
                 self._task_attempts[phrase_key] = attempts + 1
                 return True
 
-        # 5. Fallback: if SKIP is available, advance
-        if await skip_btn.count() > 0:
-            print("  [Speaking] Advancing via SKIP...")
+        # 5. Fallback: only if no recorder button exists and SKIP is available
+        if await rec_btn.count() == 0 and await skip_btn.count() > 0:
+            print("  [Speaking] No recorder button found. Advancing via SKIP...")
             await self.sleep_delay(0.2, 0.4)
             try:
                 await skip_btn.click(timeout=3000)
