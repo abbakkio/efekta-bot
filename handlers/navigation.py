@@ -129,15 +129,15 @@ class NavigationHandler(BaseHandler):
         if await self._get_step_button(target).count() > 0:
             return True
 
-        # Only allow closing lesson if we are NOT inside the lesson-player activity iframe
-        target_url = getattr(target, "url", "")
-        if "lesson-player" not in target_url and await self._get_close_lesson_button(target).count() > 0:
+        # Only allow closing lesson if we are on the lesson overview where steps are displayed
+        step_status_els = target.locator('div[role="button"][aria-label*="status"]')
+        if await step_status_els.count() > 0 and await self._get_close_lesson_button(target).count() > 0:
             all_steps_passed = await target.evaluate("""() => {
                 const steps = Array.from(document.querySelectorAll('div[role="button"][aria-label*="status"]'));
                 if (steps.length === 0) return false;
                 return steps.every(s => (s.getAttribute('aria-label') || '').includes('status passed'));
             }""")
-            is_passed = target.locator('text=/Retake lesson|Lesson passed/i').first
+            is_passed = target.locator('button:has-text("Retake lesson"), text=/Lesson passed/i').first
             if all_steps_passed or (await is_passed.count() > 0 and await is_passed.is_visible()):
                 return True
         return False
@@ -250,18 +250,19 @@ class NavigationHandler(BaseHandler):
             return True
 
         # 8. Lesson overview passed -> close lesson and return to dashboard
-        # Strictly ensure we are NOT inside lesson-player iframe, and ALL steps on overview are passed
-        if "lesson-player" not in target_url:
-            close_btn = self._get_close_lesson_button(target)
-            if await close_btn.count() > 0:
-                all_steps_passed = await target.evaluate("""() => {
-                    const steps = Array.from(document.querySelectorAll('div[role="button"][aria-label*="status"]'));
-                    if (steps.length === 0) return false;
-                    return steps.every(s => (s.getAttribute('aria-label') || '').includes('status passed'));
-                }""")
-                is_passed = target.locator('text=/Retake lesson|Lesson passed/i').first
-                has_pass_badge = await is_passed.count() > 0 and await is_passed.is_visible()
-                if all_steps_passed or has_pass_badge:
+        # Only when on lesson overview (step status elements exist) and all steps are passed
+        step_status_els = target.locator('div[role="button"][aria-label*="status"]')
+        if await step_status_els.count() > 0:
+            all_steps_passed = await target.evaluate("""() => {
+                const steps = Array.from(document.querySelectorAll('div[role="button"][aria-label*="status"]'));
+                if (steps.length === 0) return false;
+                return steps.every(s => (s.getAttribute('aria-label') || '').includes('status passed'));
+            }""")
+            is_passed = target.locator('button:has-text("Retake lesson"), text=/Lesson passed/i').first
+            has_pass_badge = await is_passed.count() > 0 and await is_passed.is_visible()
+            if all_steps_passed or has_pass_badge:
+                close_btn = self._get_close_lesson_button(target)
+                if await close_btn.count() > 0:
                     print("  [Navigation] All lesson steps passed! Closing lesson view to return to course dashboard...")
                     await self.sleep_delay(0.5, 1.0)
                     await close_btn.click()
