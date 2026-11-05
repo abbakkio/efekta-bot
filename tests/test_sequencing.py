@@ -181,3 +181,39 @@ async def test_sequencing_dom_nested_item_no_duplication():
         assert state == ["They", "with"]
 
         await browser.close()
+
+def test_sequencing_no_reset_when_tokens_move():
+    handler = SequencingHandler()
+    all_words = ["I", "like", "that", "place,", "busy."]
+    handler._check_task_reset(all_words)
+    handler._invalid_token_positions.add(("like", 1))
+
+    # Next iteration: some words are now in ordered, but the full set of words is identical
+    reordered_words = ["like", "that", "I", "busy.", "place,"]
+    handler._check_task_reset(reordered_words)
+
+    # Constraints must NOT be cleared!
+    assert ("like", 1) in handler._invalid_token_positions
+    assert len(handler._invalid_token_positions) == 1
+
+def test_sequencing_no_punctuation_at_start():
+    handler = SequencingHandler()
+    words = ["time.", "First", "Yeah,", "that's", "right."]
+    candidates = handler._get_candidate_orders(words)
+    assert len(candidates) > 0
+    top = candidates[0]
+    # Starting word cannot end with '.' or '?' or '!'
+    assert not top[0].endswith(('.', '?', '!'))
+    # Should be capitalized
+    assert top[0][0].isupper()
+
+def test_sequencing_single_punctuation_reserved_for_end():
+    handler = SequencingHandler()
+    prefix = ["We"]
+    words = ["hang", "out", "sometimes,", "when", "free."]
+    # "free." is the only word ending in '.'
+    candidates = handler._get_candidate_orders(words, prefix=prefix)
+    assert len(candidates) > 0
+    for cand in candidates:
+        assert cand[-1] == "free.", f"Expected 'free.' at the end of suffix: {cand}"
+        assert cand[0] != "free.", f"'free.' should never be immediate candidate at slot 1: {cand}"

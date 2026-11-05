@@ -127,7 +127,10 @@ class SequencingHandler(BaseHandler):
         if not all_words:
             return
         sig = tuple(sorted(all_words))
-        if self._current_task_signature != sig:
+        if self._current_task_signature is None:
+            self._current_task_signature = sig
+        elif self._current_task_signature != sig:
+            print(f"  [Sequencing] New task detected (words changed). Resetting memory.")
             self._current_task_signature = sig
             self._failed_permutations.clear()
             self._invalid_token_positions.clear()
@@ -213,57 +216,62 @@ class SequencingHandler(BaseHandler):
         p_len = len(prefix)
         total_len = p_len + len(words)
 
+        # Check if there is strictly one punctuation-ending word that should be reserved for the end
         end_candidates = [w for w in words if w.endswith(('.', '?', '!'))]
-        end = end_candidates[0] if end_candidates else None
-        if end and (end, total_len - 1) in self._invalid_token_positions:
-            end = None
+        reserved_end = None
+        if len(end_candidates) == 1 and not any(p.endswith(('.', '?', '!')) for p in prefix) and len(words) > 1:
+            if (end_candidates[0], total_len - 1) not in self._invalid_token_positions:
+                reserved_end = end_candidates[0]
 
-        start_candidates = [w for w in words if w[0].isupper() and not w.endswith(('.', '?', '!'))] if not prefix else []
-        start = start_candidates[0] if start_candidates else None
-        if start and (start, p_len) in self._invalid_token_positions:
-            start = None
+        # The pool of candidate tokens available for the immediate slot (next_slot = p_len)
+        pool_for_next = [w for w in words if w != reserved_end] if reserved_end else list(words)
+        if not pool_for_next and reserved_end:
+            pool_for_next = [reserved_end]
 
-        mid_copy = list(words)
-        if start and start in mid_copy:
-            mid_copy.remove(start)
-        if end and end in mid_copy:
-            mid_copy.remove(end)
-
-        if not mid_copy:
-            suffix = ([start] if start else []) + ([end] if end else [])
-            return [suffix] if tuple(prefix + suffix) not in self._failed_permutations else []
-
-        # Determine the immediate slot index after locked prefix (and start token if present)
-        next_slot = p_len + (1 if start else 0)
-
-        # STRICT DEDUCTIVE PRUNING:
-        # Candidate words for next_slot must NOT have failed at next_slot
-        valid_next_words = [w for w in mid_copy if (w, next_slot) not in self._invalid_token_positions]
+        # STRICT DEDUCTIVE PRUNING FOR IMMEDIATE SLOT:
+        # A word is only eligible for next_slot if it has NEVER failed at next_slot
+        valid_next_words = [
+            w for w in pool_for_next
+            if (w, p_len) not in self._invalid_token_positions
+            and not (p_len == 0 and total_len > 1 and w.endswith(('.', '?', '!')))
+        ]
         if not valid_next_words:
-            # Fallback only if every word has been marked invalid
-            valid_next_words = list(mid_copy)
+            # Fallback only if every eligible word was pruned
+            valid_next_words = [
+                w for w in pool_for_next
+                if not (p_len == 0 and total_len > 1 and w.endswith(('.', '?', '!')))
+            ] or list(pool_for_next)
 
-        # Sort valid_next_words by linguistic likelihood following the preceding token
-        prev_word = start if start else (prefix[-1] if prefix else None)
-        if prev_word:
+        # Sort valid_next_words by linguistic likelihood
+        if p_len == 0:
+            valid_next_words.sort(
+                key=lambda w: (
+                    1 if (w[0].isupper() and not w.endswith(('.', '?', '!'))) else (0.5 if w[0].isupper() else 0),
+                    self._score_sentence([w])
+                ),
+                reverse=True
+            )
+        else:
+            prev_word = prefix[-1]
             valid_next_words.sort(
                 key=lambda w: (
                     score_pair(prev_word, w),
-                    self._score_sentence(prefix + ([start] if start else []) + [w])
+                    self._score_sentence(prefix + [w])
                 ),
                 reverse=True
             )
 
         candidates = []
         for next_word in valid_next_words:
-            rest = [w for w in mid_copy if w != next_word]
+            rest = [w for w in words if w != next_word]
+            if reserved_end and reserved_end in rest:
+                rest.remove(reserved_end)
 
             if len(rest) <= 6:
                 r_perms = list(itertools.permutations(rest))
             elif len(rest) == 7:
                 r_perms = list(itertools.islice(itertools.permutations(rest), 1000))
             else:
-                # Greedy chains starting with each member of rest
                 perms = []
                 for r_cand in rest:
                     rem = [w for w in rest if w != r_cand]
@@ -278,12 +286,12 @@ class SequencingHandler(BaseHandler):
                 r_perms = perms
 
             for r_p in r_perms:
-                suffix = ([start] if start else []) + [next_word] + list(r_p) + ([end] if end else [])
+                suffix = [next_word] + list(r_p) + ([reserved_end] if reserved_end else [])
                 full = tuple(prefix + suffix)
                 if full in self._failed_permutations:
                     continue
 
-                # Check all token position constraints
+                # Check position constraints for subsequent tokens
                 violates = False
                 for j, w in enumerate(suffix):
                     abs_pos = p_len + j
@@ -297,7 +305,9 @@ class SequencingHandler(BaseHandler):
         # but NEVER relax the immediate next slot or non-failed full sequence
         if not candidates:
             for next_word in valid_next_words:
-                rest = [w for w in mid_copy if w != next_word]
+                rest = [w for w in words if w != next_word]
+                if reserved_end and reserved_end in rest:
+                    rest.remove(reserved_end)
                 chain = [next_word]
                 rem = list(rest)
                 curr = next_word
@@ -306,17 +316,12 @@ class SequencingHandler(BaseHandler):
                     chain.append(best_next)
                     rem.remove(best_next)
                     curr = best_next
-                suffix = ([start] if start else []) + chain + ([end] if end else [])
+                suffix = chain + ([reserved_end] if reserved_end else [])
                 if tuple(prefix + suffix) not in self._failed_permutations:
                     candidates.append(suffix)
 
         def score_candidate(suffix):
-            full_seq = prefix + suffix
-            score = self._score_sentence(full_seq)
-            # Heavy bonus if the immediate next token is untried at this position
-            if suffix and (suffix[0], p_len) not in self._invalid_token_positions:
-                score += 500
-            return score
+            return self._score_sentence(prefix + suffix)
 
         candidates.sort(key=score_candidate, reverse=True)
         return candidates
@@ -510,28 +515,44 @@ class SequencingHandler(BaseHandler):
         first_failed_idx = None
         for item in assessment:
             idx = item['index']
-            word = item['word'] or (full_display[idx] if idx < len(full_display) else '')
             if item['isIncorrect'] or not item['isCorrect']:
-                if first_failed_idx is None:
-                    first_failed_idx = idx
-                if word:
-                    self._invalid_token_positions.add((word, idx))
+                first_failed_idx = idx
+                break
 
         if first_failed_idx is not None and first_failed_idx < len(full_display):
             failed_word = full_display[first_failed_idx]
+            self._invalid_token_positions.add((failed_word, first_failed_idx))
             print(f"  [Sequencing] Word '{failed_word}' incorrect at position {first_failed_idx}. Excluded from slot {first_failed_idx}.")
         elif len(full_display) > 1:
-            fallback_idx = 1
+            fallback_idx = 0
             self._invalid_token_positions.add((full_display[fallback_idx], fallback_idx))
 
-        # Wait for Efekta's 1500ms reset timer to complete
-        await asyncio.sleep(1.2)
+        # Wait for Efekta's reset animation to complete (incorrect items are returned to unordered pool)
+        for _ in range(8):
+            await asyncio.sleep(0.3)
+            still_animating = await target.evaluate('''() => {
+                const items = Array.from(document.querySelectorAll('.ordered-item-container > li, .ordered-item-container ef-sequencing-tap-option-item'))
+                    .filter(el => el.tagName === 'LI' || !el.closest('li'));
+                return items.some(el => el.classList.contains('is-incorrect') || el.classList.contains('item-incorrect'));
+            }''')
+            if not still_animating:
+                break
 
-        # Return any unconfirmed items that still have a button back to the pool
+        # Return any unconfirmed/incorrect items that still remain in the ordered container
         while True:
             ret = await target.evaluate('''() => {
-                const b = document.querySelector('.ordered-item-container button');
-                if (b) { b.click(); return true; }
+                const items = Array.from(document.querySelectorAll('.ordered-item-container > li, .ordered-item-container ef-sequencing-tap-option-item'))
+                    .filter(el => el.tagName === 'LI' || !el.closest('li'));
+                for (const item of items) {
+                    const isCorrect = item.classList.contains('is-correct') || item.classList.contains('item-correct') || item.querySelector('.is-correct, .item-correct, .correct-circle, ef-svg-thumbs-up, [id="thumbs-up"]');
+                    if (!isCorrect) {
+                        const b = item.querySelector('button') || (item.tagName === 'BUTTON' ? item : null);
+                        if (b) {
+                            b.click();
+                            return true;
+                        }
+                    }
+                }
                 return false;
             }''')
             if not ret:
@@ -554,10 +575,8 @@ class SequencingHandler(BaseHandler):
 
         check_btn = target.locator('button.check-task-button:visible').first
 
-        # Collect all words in the exercise to detect task changes
+        # Collect all words in the exercise to detect task changes (MUST inspect both ordered and unordered)
         all_words = await target.evaluate(r'''() => {
-            const words = Array.from(document.querySelectorAll('.unordered-item-container [data-qa="markdown-element-container"]')).map(el => el.textContent.trim()).filter(Boolean);
-            if (words.length > 0) return words;
             const extractWord = (b) => {
                 if (!b) return '';
                 const el = b.querySelector('[data-qa="markdown-element-container"]');
@@ -566,9 +585,9 @@ class SequencingHandler(BaseHandler):
             };
             const items = Array.from(document.querySelectorAll('.ordered-item-container > li'));
             const orderedEls = items.length > 0 ? items : Array.from(document.querySelectorAll('.ordered-item-container ef-sequencing-tap-option-item'));
-            const ordered = orderedEls.map(extractWord);
-            const unordered = Array.from(document.querySelectorAll('.unordered-item-container button')).map(extractWord);
-            return [...ordered, ...unordered].filter(Boolean);
+            const ordered = orderedEls.map(extractWord).filter(Boolean);
+            const unordered = Array.from(document.querySelectorAll('.unordered-item-container button')).map(extractWord).filter(Boolean);
+            return [...ordered, ...unordered];
         }''')
         self._check_task_reset(all_words)
 
@@ -633,8 +652,18 @@ class SequencingHandler(BaseHandler):
             print("  [Sequencing] Resetting unassessed ordered tokens to pool...")
             while True:
                 ret = await target.evaluate('''() => {
-                    const b = document.querySelector('.ordered-item-container button');
-                    if (b) { b.click(); return true; }
+                    const items = Array.from(document.querySelectorAll('.ordered-item-container > li, .ordered-item-container ef-sequencing-tap-option-item'))
+                        .filter(el => el.tagName === 'LI' || !el.closest('li'));
+                    for (const item of items) {
+                        const isCorrect = item.classList.contains('is-correct') || item.classList.contains('item-correct') || item.querySelector('.is-correct, .item-correct, .correct-circle, ef-svg-thumbs-up, [id="thumbs-up"]');
+                        if (!isCorrect) {
+                            const b = item.querySelector('button') || (item.tagName === 'BUTTON' ? item : null);
+                            if (b) {
+                                b.click();
+                                return true;
+                            }
+                        }
+                    }
                     return false;
                 }''')
                 if not ret:
