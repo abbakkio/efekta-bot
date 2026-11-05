@@ -49,6 +49,7 @@ async def test_speaking_skips_immediately_when_evaluated_incorrect():
     rec_btn = MagicMock()
     rec_btn.count = AsyncMock(return_value=1)
     rec_btn.get_attribute = AsyncMock(side_effect=lambda attr: "Not quite right, please try again!" if attr == "aria-label" else "audio-recorder-btn no-pointer")
+    rec_btn.locator.return_value.count = AsyncMock(return_value=0)
 
     skip_btn = MagicMock()
     skip_btn.count = AsyncMock(return_value=1)

@@ -9,12 +9,14 @@ class NavigationHandler(BaseHandler):
         super().__init__()
         self._consecutive_dialogs = 0
         self._consecutive_nexts = 0
+        self._consecutive_finish_skipped = 0
         self._last_state_signature = None
 
     def reset_circuit_breakers(self):
         """Resets click counters when another handler (choice, input, media) acts."""
         self._consecutive_dialogs = 0
         self._consecutive_nexts = 0
+        self._consecutive_finish_skipped = 0
 
     def _get_dialog_button(self, target: Page | Frame):
         return target.locator(
@@ -185,16 +187,36 @@ class NavigationHandler(BaseHandler):
         is_unpassed = await target.locator('text=/Activity: Not passed|Step not passed/i').count() > 0
         finish_skipped = self._get_finish_skipped_button(target)
         if is_unpassed and not is_step_passed and await finish_skipped.count() > 0:
+            self._consecutive_finish_skipped += 1
+            if self._consecutive_finish_skipped > 3:
+                print("  [Navigation] Circuit breaker: 'Finish skipped tasks' clicked repeatedly. Advancing to next activity/step...")
+                incomplete_act = self._get_incomplete_activity_button(target)
+                if await incomplete_act.count() > 0:
+                    await incomplete_act.click(timeout=3000)
+                    await self.sleep_delay(1.0, 1.5)
+                    return True
+                step_btn = self._get_step_button(target)
+                if await step_btn.count() > 0:
+                    await step_btn.click(timeout=3000)
+                    await self.sleep_delay(1.0, 1.5)
+                    return True
+                return False
+
             txt = (await finish_skipped.inner_text()).strip()
             print(f"  [Navigation] Activity/Step not passed. Clicking '{txt}' to achieve required passing score...")
             await self.sleep_delay(0.5, 1.0)
             try:
                 await finish_skipped.click(timeout=3000)
             except Exception:
-                await finish_skipped.dispatch_event("click")
+                try:
+                    await finish_skipped.dispatch_event("click", timeout=3000)
+                except Exception:
+                    pass
             await self.sleep_delay(1.0, 1.5)
             self._consecutive_nexts = 0
             return True
+        else:
+            self._consecutive_finish_skipped = 0
 
         # 4. Step launcher buttons on lesson overview or step summary (e.g. "Start next step" / "Start step")
         step_btn = self._get_step_button(target)

@@ -53,22 +53,22 @@ class SpeakingHandler(BaseHandler):
         return nodes
 
     def _generate_wav(self, text: str) -> str:
-        """Synthesizes text to a 16-bit 44.1kHz WAV file using macOS say command."""
+        """Synthesizes text to a 16-bit 16kHz mono WAV file using macOS say command."""
         wav_path = f"/tmp/efekta_speech_{os.getpid()}.wav"
         clean_text = re.sub(r"[_]+", "", text)
-        clean_text = clean_text.replace('"', '').replace("'", '').replace('\n', ' ')
+        clean_text = clean_text.replace('"', '').replace('\n', ' ')
         clean_text = re.sub(r"\s+", " ", clean_text).strip()
         if not clean_text:
             return ""
 
         try:
             subprocess.run([
-                "say", "-v", "Samantha", "-o", wav_path, "--data-format=LEI16@44100", clean_text
+                "say", "-v", "Samantha", "-o", wav_path, "--data-format=LEI16@16000", clean_text
             ], check=True, timeout=8)
         except Exception:
             try:
                 subprocess.run([
-                    "say", "-o", wav_path, "--data-format=LEI16@44100", clean_text
+                    "say", "-o", wav_path, "--data-format=LEI16@16000", clean_text
                 ], check=True, timeout=8)
             except Exception as e:
                 print(f"    [Speaking] Note: Failed to generate TTS audio ({e})")
@@ -300,7 +300,7 @@ class SpeakingHandler(BaseHandler):
         if not text:
             return
         clean_p = re.sub(r"[_]+", "", text)
-        clean_p = clean_p.replace('"', '').replace("'", '').replace('\n', ' ')
+        clean_p = clean_p.replace('"', '').replace('\n', ' ')
         clean_p = re.sub(r"\s+", " ", clean_p).strip()
         if not clean_p:
             return
@@ -308,7 +308,7 @@ class SpeakingHandler(BaseHandler):
         try:
             p = subprocess.Popen(["say", "-v", "Samantha", clean_p])
             try:
-                p.wait(timeout=3.5)
+                p.wait(timeout=4.0)
             except subprocess.TimeoutExpired:
                 p.kill()
         except Exception as e:
@@ -335,9 +335,8 @@ class SpeakingHandler(BaseHandler):
             try:
                 if await rec_btn.count() > 0:
                     aria = (await rec_btn.get_attribute("aria-label") or "").lower()
-                    cls = (await rec_btn.get_attribute("class") or "").lower()
                     has_replay = await target.locator('ef-svg-replay').count() > 0
-                    if "not quite right" in aria or "try again" in aria or "no-pointer" in cls or has_replay:
+                    if "not quite right" in aria or "try again" in aria or has_replay:
                         return True
             except Exception:
                 pass
@@ -386,38 +385,55 @@ class SpeakingHandler(BaseHandler):
             pass
 
         phrase_key = task_sig if task_sig else (detected[:40] if detected else "generic_speech_task")
+
+        aria_label = ""
+        is_recording = False
+        has_replay = False
+        if await rec_btn.count() > 0:
+            aria_label = (await rec_btn.get_attribute("aria-label") or "").lower()
+            is_recording = await rec_btn.locator('ef-svg-stop').count() > 0 or "recording" in aria_label or "stop" in aria_label
+            has_replay = await target.locator('ef-svg-replay').count() > 0
+
+        # Reset attempts counter if task is fresh / ready to record
+        if "click to record" in aria_label or "record your" in aria_label or (not is_recording and not has_replay and "not quite" not in aria_label and "try again" not in aria_label):
+            if not has_replay and "not quite" not in aria_label and "try again" not in aria_label:
+                if "click to record" in aria_label or "record your" in aria_label:
+                    self._task_attempts[phrase_key] = 0
+
         attempts = self._task_attempts.get(phrase_key, 0)
 
         is_mc_speech = await target.locator('ef-multiple-choice-speech-task:visible').count() > 0
-        max_attempts = 2 if is_mc_speech else 1
+        mc_options_count = await target.locator('ef-multiple-choice-speech-task-response-option:visible').count()
+        max_attempts = mc_options_count if is_mc_speech and mc_options_count > 0 else 1
 
-        # 1. Check if the recorder is in evaluated (incorrect / replay / no-pointer) state
-        is_evaluated_incorrect = False
-        aria_label = ""
-        class_attr = ""
-        if await rec_btn.count() > 0:
-            aria_label = (await rec_btn.get_attribute("aria-label") or "").lower()
-            class_attr = (await rec_btn.get_attribute("class") or "").lower()
-            has_replay = await target.locator('ef-svg-replay').count() > 0
-            if "not quite right" in aria_label or "try again" in aria_label or "no-pointer" in class_attr or has_replay:
-                is_evaluated_incorrect = True
+        # 1. Check if the recorder is explicitly evaluated as incorrect
+        is_evaluated_incorrect = "not quite right" in aria_label or "try again" in aria_label or has_replay
 
-        # 2. If already evaluated as incorrect or attempt threshold reached:
-        if is_evaluated_incorrect or attempts >= max_attempts or (not is_mc_speech and is_evaluated_incorrect):
-            if await skip_btn.count() > 0:
-                print(f"  [Speaking] Evaluation incorrect ({aria_label or 'try again'}) or threshold reached. Advancing via SKIP...")
-                await self.sleep_delay(0.2, 0.4)
+        # 2. Advance via SKIP only if:
+        #    a) pure speaking practice evaluated as incorrect, OR
+        #    b) attempt threshold reached on multiple choice speech task
+        should_skip = False
+        if is_evaluated_incorrect and not is_mc_speech:
+            should_skip = True
+        elif attempts >= max_attempts:
+            should_skip = True
+
+        if should_skip and await skip_btn.count() > 0:
+            print(f"  [Speaking] Task evaluated as incorrect or attempt threshold ({attempts}/{max_attempts}) reached. Advancing via SKIP...")
+            await self.sleep_delay(0.2, 0.4)
+            try:
+                await skip_btn.click(timeout=3000)
+            except Exception:
                 try:
-                    await skip_btn.click(timeout=3000)
+                    await skip_btn.dispatch_event("click", timeout=3000)
                 except Exception:
-                    await skip_btn.dispatch_event("click")
-                await self.sleep_delay(1.0, 1.5)
-                self._task_attempts[phrase_key] = 0
-                return True
+                    pass
+            await self.sleep_delay(1.0, 1.5)
+            self._task_attempts[phrase_key] = 0
+            return True
 
         # 3. Handle active recording in progress (e.g. Efekta auto-started recording)
         if await rec_btn.count() > 0:
-            is_recording = await rec_btn.locator('ef-svg-stop').count() > 0 or "recording" in aria_label or "stop" in aria_label
             if is_recording:
                 print("  [Speaking] Recording in progress. Speaking phrase aloud...")
                 self._speak_phrase_aloud(detected or self._last_detected_phrase)
@@ -428,7 +444,10 @@ class SpeakingHandler(BaseHandler):
                     try:
                         await stop_btn.click(timeout=3000)
                     except Exception:
-                        await stop_btn.dispatch_event("click")
+                        try:
+                            await stop_btn.dispatch_event("click", timeout=3000)
+                        except Exception:
+                            pass
                 await self._wait_for_evaluation(target)
                 self._task_attempts[phrase_key] = attempts + 1
                 return True
@@ -439,7 +458,10 @@ class SpeakingHandler(BaseHandler):
                 try:
                     await rec_btn.click(timeout=3000)
                 except Exception:
-                    await rec_btn.dispatch_event("click")
+                    try:
+                        await rec_btn.dispatch_event("click", timeout=3000)
+                    except Exception:
+                        pass
 
                 await asyncio.sleep(0.3)
                 self._speak_phrase_aloud(detected or self._last_detected_phrase)
@@ -453,7 +475,10 @@ class SpeakingHandler(BaseHandler):
                         try:
                             await stop_btn.click(timeout=3000)
                         except Exception:
-                            await stop_btn.dispatch_event("click")
+                            try:
+                                await stop_btn.dispatch_event("click", timeout=3000)
+                            except Exception:
+                                pass
 
                 await self._wait_for_evaluation(target)
                 self._task_attempts[phrase_key] = attempts + 1
@@ -466,7 +491,10 @@ class SpeakingHandler(BaseHandler):
             try:
                 await skip_btn.click(timeout=3000)
             except Exception:
-                await skip_btn.dispatch_event("click")
+                try:
+                    await skip_btn.dispatch_event("click", timeout=3000)
+                except Exception:
+                    pass
             await self.sleep_delay(1.0, 1.5)
             return True
 
