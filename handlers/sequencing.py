@@ -105,6 +105,8 @@ class SequencingHandler(BaseHandler):
         self._failed_permutations = set()
         self._invalid_token_positions = set()  # set of (word, absolute_position_index)
         self._current_task_signature = None
+        self._assign_index_failed_positions = set()  # set of (item_idx, pos)
+        self._assign_index_task_id = None
 
     def _check_task_reset(self, all_words: list[str]):
         """Resets failed permutations and position constraints when a new task is detected."""
@@ -125,7 +127,7 @@ class SequencingHandler(BaseHandler):
         if await next_btn.count() > 0:
             return False
 
-        task = target.locator('ef-sequencing-tap-option-task:visible, ef-sequencing-task:visible, ef-sequencing-sort-column-task:visible')
+        task = target.locator('ef-sequencing-tap-option-task:visible, ef-sequencing-task:visible, ef-sequencing-sort-column-task:visible, ef-sequencing-assign-index-task:visible')
         if await task.count() > 0:
             return True
 
@@ -296,6 +298,104 @@ class SequencingHandler(BaseHandler):
             await asyncio.sleep(2.0)
         return True
 
+    async def _handle_assign_index(self, target: Page | Frame) -> bool:
+        """Handles ef-sequencing-assign-index-task (ordering items/images by assigning index positions 1..N via drawer)."""
+        next_btn = target.locator(
+            'button[class*="next-task-button"]:not([disabled]):not(.mat-mdc-button-disabled):visible, '
+            'button.mat-mdc-unelevated-button:not([disabled]):not(.mat-mdc-button-disabled):visible:has-text("Next")'
+        ).first
+        if await next_btn.count() > 0:
+            return False
+
+        task_el = target.locator('ef-sequencing-assign-index-task:visible').first
+        task_id = await task_el.get_attribute("taskid") or "assign_index_task"
+        if self._assign_index_task_id != task_id:
+            self._assign_index_task_id = task_id
+            self._assign_index_failed_positions.clear()
+
+        # Inspect all items
+        items = await target.evaluate('''() => {
+            return Array.from(document.querySelectorAll('ef-sequencing-assign-index-item')).map((item, i) => {
+                const btn = item.querySelector('.assessment-area');
+                return {
+                    i,
+                    val: item.querySelector('.slot') ? item.querySelector('.slot').innerText.trim() : '',
+                    isCorrect: btn ? (btn.classList.contains('is-correct') || btn.classList.contains('item-correct')) : false,
+                    isIncorrect: btn ? (btn.classList.contains('is-incorrect') || btn.classList.contains('item-incorrect')) : false
+                };
+            });
+        }''')
+
+        if not items:
+            return False
+
+        # Record failed positions from current state
+        for item in items:
+            if item['isIncorrect'] and item['val'].isdigit():
+                self._assign_index_failed_positions.add((item['i'], int(item['val'])))
+
+        n_items = len(items)
+        all_positions = set(range(1, n_items + 1))
+        locked_positions = {int(item['val']) for item in items if item['isCorrect'] and item['val'].isdigit()}
+        remaining_positions = sorted(list(all_positions - locked_positions))
+        unlocked_items = [item['i'] for item in items if not item['isCorrect']]
+
+        if not unlocked_items:
+            check_btn = target.locator('button.check-task-button:not(.is-aria-disabled):not([disabled]):visible').first
+            if await check_btn.count() > 0:
+                await check_btn.click()
+                await asyncio.sleep(1.5)
+                return True
+            return False
+
+        # Find best permutation of remaining positions for unlocked items
+        valid_perms = []
+        for perm in itertools.permutations(remaining_positions):
+            if all((unlocked_items[j], perm[j]) not in self._assign_index_failed_positions for j in range(len(unlocked_items))):
+                valid_perms.append(perm)
+
+        chosen_perm = valid_perms[0] if valid_perms else (list(itertools.permutations(remaining_positions))[0] if remaining_positions else [])
+
+        # Assign positions via drawer
+        for item_idx, target_pos in zip(unlocked_items, chosen_perm):
+            curr_val = items[item_idx]['val']
+            if curr_val != str(target_pos):
+                print(f"  [Sequencing] Assigning Position {target_pos} to item {item_idx + 1}...")
+                item_loc = target.locator('ef-sequencing-assign-index-item').nth(item_idx)
+                btn = item_loc.locator('button.assessment-area')
+                await btn.click()
+                await asyncio.sleep(0.4)
+                opt = target.locator(f'div.drawer-option[aria-label="Position {target_pos}"]').first
+                if await opt.count() > 0:
+                    await opt.click()
+                    await asyncio.sleep(0.4)
+
+        # Check if check button is enabled
+        check_btn = target.locator('button.check-task-button:not(.is-aria-disabled):not([disabled]):visible').first
+        if await check_btn.count() > 0:
+            print("  [Sequencing] Submitting assign-index sequence...")
+            await check_btn.click()
+            await asyncio.sleep(1.5)
+
+            # Re-read assessment to record feedback immediately
+            res = await target.evaluate('''() => {
+                return Array.from(document.querySelectorAll('ef-sequencing-assign-index-item')).map((item, i) => {
+                    const btn = item.querySelector('.assessment-area');
+                    return {
+                        i,
+                        val: item.querySelector('.slot') ? item.querySelector('.slot').innerText.trim() : '',
+                        isCorrect: btn ? (btn.classList.contains('is-correct') || btn.classList.contains('item-correct')) : false,
+                        isIncorrect: btn ? (btn.classList.contains('is-incorrect') || btn.classList.contains('item-incorrect')) : false
+                    };
+                });
+            }''')
+            for r in res:
+                if r['isIncorrect'] and r['val'].isdigit():
+                    self._assign_index_failed_positions.add((r['i'], int(r['val'])))
+            return True
+
+        return True
+
     async def _submit_and_record(self, target: Page | Frame, check_btn, full_display: list[str]) -> bool:
         """Clicks Check, reads per-token assessment, records invalid token positions, and resets unconfirmed tokens."""
         print(f"  [Sequencing] Submitting sequence: {' '.join(full_display)}...")
@@ -384,6 +484,11 @@ class SequencingHandler(BaseHandler):
         return True
 
     async def handle(self, target: Page | Frame) -> bool:
+        # Check if assign index task is active (ef-sequencing-assign-index-task)
+        assign_index = target.locator('ef-sequencing-assign-index-task:visible')
+        if await assign_index.count() > 0:
+            return await self._handle_assign_index(target)
+
         # Check if CDK Drag and Drop column sorting is active (ef-sequencing-sort-column-task)
         sort_column = target.locator('ef-sequencing-sort-column-task:visible')
         tap_task = target.locator('ef-sequencing-tap-option-task:visible, .unordered-item-container:visible')
@@ -446,7 +551,7 @@ class SequencingHandler(BaseHandler):
                 .filter(b => b.offsetParent !== null && !b.classList.contains('is-hidden') && !b.hasAttribute('hidden'))
                 .map(extractWord).filter(Boolean);
             const checkBtn = document.querySelector('button.check-task-button');
-            const checkEnabled = checkBtn && !checkBtn.disabled && !checkBtn.classList.contains('mat-mdc-button-disabled');
+            const checkEnabled = checkBtn && !checkBtn.disabled && !checkBtn.classList.contains('mat-mdc-button-disabled') && !checkBtn.classList.contains('is-aria-disabled');
             return {
                 lockedPrefix,
                 unassessedOrdered,
