@@ -440,7 +440,10 @@ class SequencingHandler(BaseHandler):
             }
 
             const unassessedOrdered = orderedEls.slice(lockedPrefix.length).map(extractWord).filter(Boolean);
-            const unorderedWords = Array.from(document.querySelectorAll('.unordered-item-container button'))
+            const unorderedWords = Array.from(document.querySelectorAll(
+                '.unordered-item-container button:not(.is-hidden):not([hidden])'
+            ))
+                .filter(b => b.offsetParent !== null && !b.classList.contains('is-hidden') && !b.hasAttribute('hidden'))
                 .map(extractWord).filter(Boolean);
             const checkBtn = document.querySelector('button.check-task-button');
             const checkEnabled = checkBtn && !checkBtn.disabled && !checkBtn.classList.contains('mat-mdc-button-disabled');
@@ -484,7 +487,8 @@ class SequencingHandler(BaseHandler):
                 if (el) return el.innerText.trim();
                 return (b.innerText || '').split('\n')[0].trim();
             };
-            return Array.from(document.querySelectorAll('.unordered-item-container button'))
+            return Array.from(document.querySelectorAll('.unordered-item-container button:not(.is-hidden):not([hidden])'))
+                .filter(b => b.offsetParent !== null && !b.classList.contains('is-hidden') && !b.hasAttribute('hidden'))
                 .map(extractWord).filter(Boolean);
         }''')
 
@@ -513,7 +517,9 @@ class SequencingHandler(BaseHandler):
                     if (el) return el.innerText.trim();
                     return (b.innerText || '').split('\n')[0].trim();
                 };
-                const btns = Array.from(document.querySelectorAll('.unordered-item-container button'));
+                const btns = Array.from(document.querySelectorAll(
+                    '.unordered-item-container button:not(.is-hidden):not([hidden])'
+                )).filter(b => b.offsetParent !== null && !b.classList.contains('is-hidden') && !b.hasAttribute('hidden'));
                 for (const b of btns) {
                     if (extractWord(b) === targetWord) {
                         b.click();
