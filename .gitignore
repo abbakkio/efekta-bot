@@ -1,0 +1,42 @@
+# Virtual Environment
+.venv/
+venv/
+ENV/
+env/
+
+# Python Cache & Testing
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Sensitive Environment & Credentials (CRITICAL - DO NOT COMMIT)
+.env
+.env.*
+!.env.example
+session_state.json
+
+# Native Browser Profiles & Cookies (CRITICAL - DO NOT COMMIT)
+chrome_profile/
+
+# Temporary, Media, and Scratch Files
+scratch/
+*.wav
+*.mp3
+*.ogg
+*.png
+*.jpg
+*.jpeg
+*.log
+error_state.png
+
+# Operating System Files
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
